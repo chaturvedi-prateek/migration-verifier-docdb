@@ -303,6 +303,27 @@ default `failAll`, aborts the run. If DocumentDB emits types we don't expect
 **How to check.** Create/drop collections and indexes while watching, and
 record every `operationType` observed.
 
+### Q20. `config.collections` is queryable (or absent, not forbidden) — **OPEN**
+
+**Assumption.** `sharding.GetShardKey` can run
+`config.collections.findOne({_id: "<ns>"})` against DocumentDB and get either
+no document or a clean empty result.
+
+**Why it matters.** It runs on every collection during generation 0, before
+partitioning (`migration_verifier.go`, `partitionCollection` →
+`getShardKeyFields`). It already swallows `ErrNoDocuments` and reports "not
+sharded", which is the right answer for DocumentDB. But if DocumentDB instead
+*errors* on reading the `config` database — unsupported namespace, or an
+authorization failure — partitioning fails for every collection.
+
+**How to check.**
+
+```js
+db.getSiblingDB("config").collections.findOne({_id: "somedb.somecoll"})
+```
+
+Expected: `null`, not an error.
+
 ---
 
 ## Priority 3 — nice to confirm
