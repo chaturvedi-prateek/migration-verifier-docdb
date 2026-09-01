@@ -325,7 +325,9 @@ func (rc *ChangeReaderCommon) start(
 
 			err := retryer.WithCallback(
 				func(ctx context.Context, ri *retry.FuncInfo) error {
-					sess, err := rc.watcherClient.StartSession()
+					sess, err := rc.watcherClient.StartSession(
+						sessionOptsForFlavor(rc.clusterInfo.Flavor),
+					)
 					if err != nil {
 						return errors.Wrap(err, "failed to start session")
 					}

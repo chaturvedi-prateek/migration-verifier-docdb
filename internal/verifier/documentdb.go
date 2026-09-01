@@ -6,11 +6,13 @@ import (
 	"strings"
 
 	"github.com/10gen/migration-verifier/internal/logger"
+	"github.com/10gen/migration-verifier/internal/util"
 	"github.com/10gen/migration-verifier/mmongo"
 	mapset "github.com/deckarep/golang-set/v2"
 	"github.com/pkg/errors"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
 // DocumentDB enables change streams per collection, per database, or
@@ -437,4 +439,30 @@ func normalizeIndexSpecsForDocumentDB(specs map[string]bson.Raw) error {
 	}
 
 	return nil
+}
+
+// sessionOptsForFlavor returns the session options to use against a cluster of
+// the given flavor.
+//
+// The Go driver creates causally-consistent sessions by default. DocumentDB
+// does not implement causal consistency and rejects such reads outright with
+// error 303, "Feature not supported: 'causal consistency'".
+//
+// This does not fail immediately, which is what makes it dangerous: a session's
+// first operation carries no afterClusterTime, so opening a change stream
+// succeeds. Only once the session has recorded an operationTime does the driver
+// start sending afterClusterTime — so the failure appears on the first *resume*,
+// which in practice means during a failover, long after the run looked healthy.
+//
+// Disabling causal consistency costs us nothing here. The verifier never relied
+// on it against DocumentDB: reads are ordered by opening the change reader
+// before any scan and trusting the primary's read-after-write guarantee.
+func sessionOptsForFlavor(flavor util.Flavor) *options.SessionOptionsBuilder {
+	opts := options.Session()
+
+	if flavor.IsDocumentDB() {
+		opts = opts.SetCausalConsistency(false)
+	}
+
+	return opts
 }

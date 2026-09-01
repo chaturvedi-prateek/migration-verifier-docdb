@@ -325,7 +325,9 @@ func (verifier *Verifier) getFetcherChannelsAndCallbacksForNaturalPartition(
 			close(dstToCompareChannel)
 		}()
 
-		sess, err := verifier.dstClient.StartSession()
+		sess, err := verifier.dstClient.StartSession(
+			sessionOptsForFlavor(verifier.dstClusterInfo.Flavor),
+		)
 		if err != nil {
 			return errors.Wrapf(err, "starting session")
 		}
@@ -502,7 +504,9 @@ func (verifier *Verifier) getFetcherChannelsAndCallbacksForIDPartition(
 		//
 		// Ideally the driver would just expose the individual server responses’
 		// cluster times, but alas.
-		sess, err := verifier.srcClient.StartSession()
+		sess, err := verifier.srcClient.StartSession(
+			sessionOptsForFlavor(verifier.srcClusterInfo.Flavor),
+		)
 		if err != nil {
 			return errors.Wrapf(err, "starting session")
 		}
@@ -546,7 +550,9 @@ func (verifier *Verifier) getFetcherChannelsAndCallbacksForIDPartition(
 	}
 
 	readDstCallback := func(ctx context.Context, state retry.SuccessNotifier) error {
-		sess, err := verifier.dstClient.StartSession()
+		sess, err := verifier.dstClient.StartSession(
+			sessionOptsForFlavor(verifier.dstClusterInfo.Flavor),
+		)
 		if err != nil {
 			return errors.Wrapf(err, "starting session")
 		}

@@ -168,7 +168,27 @@ do not depend on an undocumented format.)
 `keystring.KeystringToBson(keystring.V1, ...)` rejects it. Also confirm the
 token stays opaque-but-valid when passed back via `resumeAfter`.
 
-### Q4. Resume-token expiry is detectable — **OPEN**
+### Q4. Resume-token expiry is detectable — **CLUSTER** (5.0.0, 2026-09-01) — gate was wrong, now fixed
+
+> **The gate was failing open.** DocumentDB reports an expired token as
+> **code 136**, `"CappedPositionLost: CollectionScan died due to position in
+> capped collection being deleted."` It names the mechanism — its change stream
+> log is a capped collection — rather than the meaning, and shares neither the
+> code nor any wording with MongoDB's ChangeStreamHistoryLost (286).
+>
+> The step-5 gate matched 286 plus four MongoDB phrasings, none of which hit.
+> A verifier resuming after its token aged out would have continued **across an
+> unobserved gap** and reported a match it could not justify.
+>
+> `IsChangeStreamHistoryLostError` now matches code 136 and
+> "cappedpositionlost", with a regression test carrying the real error.
+>
+> A malformed token is distinct: **code 9**, `"Invalid resume token"`. That is
+> deliberately *not* treated as lost history, since it indicates corruption
+> rather than expiry.
+>
+> Reproduced without waiting out a retention window by resuming from a token
+> whose timestamp prefix was rewritten to a past date.
 
 **Assumption.** Resuming with a token older than the retention window returns a
 distinguishable error rather than silently starting from somewhere else.
@@ -256,7 +276,29 @@ it, opening a change stream fails with "session has no operationTime".
 **How to check.** Run `hello`, `ping`, and `dbStats` via `runCommand` and
 inspect the raw replies for `operationTime`. Confirm it advances after writes.
 
-### Q8. Change stream survives a failover without a gap — **OPEN**
+### Q8. Change stream survives a failover without a gap — **CLUSTER** (5.0.0, 2026-09-01) — no gap
+
+> **No events were lost.** A real primary restart was performed while a writer
+> inserted sequential `_id`s into the source every 200 ms and the verifier
+> watched.
+>
+> The failover produced 30 `ECONNRESET` write failures and **crashed the
+> verifier** (see Q29). It was restarted ~2 minutes later and resumed from its
+> persisted token.
+>
+> Gap analysis: of the documents the source actually held that were written
+> before the writes-off fence, **872 of 872 were reported** as
+> destination-missing. **Gap count: 0** — across a failover, a crash, two
+> minutes of downtime, and a token resume.
+>
+> The verifier reported 1650 documents in total, more than the 872 pre-fence
+> ones, because it also caught post-fence writes that arrived before the drain
+> ended. Extra rechecks are the safe direction.
+>
+> Note the writer's acknowledged count (1131) exceeds what the source held from
+> before the fence, because ~12 writes that returned `ECONNRESET` during the
+> failover had in fact been applied — ordinary non-retryable-write ambiguity,
+> not a verifier issue.
 
 **Assumption.** After a primary failover, the reader resumes from its persisted
 token with no unobserved changes, and primary read-after-write consistency
@@ -446,7 +488,27 @@ timestamp using `startAtOperationTime` (4.0+)". `startAfter` is absent.
 
 **How to check.** Attempt a `startAfter` watch and record the error.
 
-### Q16. DDL and non-CRUD event types — **OPEN**
+### Q16. DDL and non-CRUD event types — **CLUSTER** (5.0.0, 2026-09-01)
+
+> **DocumentDB emits only four operation types**: `insert`, `update`,
+> `delete`, and `drop`.
+>
+> Observed by running `createCollection`, `createIndex`, `dropIndex`,
+> `updateOne`, `deleteOne`, and `drop()` against a database-level change
+> stream. Collection creation and **all index DDL produced no events at all**.
+>
+> Two consequences:
+>
+> 1. **Index changes on a DocumentDB source are invisible to the verifier.**
+>    On MongoDB, `createIndexes`/`dropIndexes` surface as DDL events and are
+>    warned about or rejected. On DocumentDB nothing arrives, so an index
+>    created or dropped mid-run passes unnoticed. Generation 0 already compared
+>    the indexes, so a later change is simply never seen.
+> 2. `drop` is in neither `supportedEventOpTypes` nor `allowedSrcDDLOpTypes`,
+>    so dropping a collection aborts the run with `UnknownEventError` even
+>    under `--ddlHandling warnMost`. That matches MongoDB's behaviour for
+>    `drop` and seems right — but on DocumentDB it is the *only* DDL that can
+>    ever abort a run.
 
 **Assumption.** We know which `operationType` values DocumentDB emits.
 
@@ -517,7 +579,33 @@ db.adminCommand({hello: 1}).operationTime   // expect a Timestamp, not undefined
 If absent, find a command that does return one (`dbStats`, `find`, …) and use
 that in `getDocumentDBServerTime` instead.
 
-### Q22. The quiescence drain terminates correctly — **OPEN**
+### Q22. The quiescence drain terminates correctly — **CLUSTER** (5.0.0, 2026-09-01)
+
+> **Confirmed end to end.** Triggering `/api/v1/writesOff` mid-run produced:
+>
+> ```
+> Read DocumentDB server time. operationTime={T:1788269756}
+> source change stream reader draining to quiescence. requiredIdlePolls=3
+> source change stream reader has drained past the writesOff timestamp.
+>     idlePolls=3 serverTimestamp={T:1788269760} writesOffTimestamp={T:1788269756}
+> Final generation done. generation=37
+> ```
+>
+> Both termination conditions fired as designed: the server clock passed the
+> fence (…760 > …756) *and* three consecutive idle polls elapsed, taking ~3 s
+> at the 1 s await time. `getDocumentDBServerTime` supplied the fence in place
+> of `appendOplogNote`.
+>
+> The destination, being MongoDB, took the ordinary resume-token path in the
+> same run, so both drains were exercised together.
+>
+> **Superseded in part by Q30**: this confirmation was run against a quiesced
+> source. With writes continuing past writes-off, the idle rule alone hangs
+> forever. The drain now also terminates on consuming an event past the fence.
+>
+> Still untested: a drain racing a long-running `updateMany`, which AWS
+> documents as able to stall change stream writes and could in principle
+> produce a deceptive lull.
 
 **Assumption.** After writes stop, `operationTime` advances past the fence and
 the change stream returns `docDBDrainIdlePolls` consecutive empty batches
@@ -669,6 +757,56 @@ requirement.
 > DocumentDB rejects that: `Feature not supported: array for $type filter`.
 > **`FilterIdBounds` must keep using the `$expr` path for DocumentDB.**
 
+### Q29. Sessions must disable causal consistency — **CLUSTER** (5.0.0, 2026-09-01) — fixed
+
+> **Found by the failover test; it crashed the verifier.**
+>
+> ```
+> Non-retryable error: change stream iteration failed:
+>   Feature not supported: 'causal consistency'   (code 303)
+> ```
+>
+> The Go driver creates causally-consistent sessions by default. This does not
+> fail immediately, which is what makes it dangerous: a session's first
+> operation carries no `afterClusterTime`, so opening a change stream succeeds
+> and the run looks healthy indefinitely — 32 generations passed here. Only
+> once the session has recorded an `operationTime` does the driver begin
+> sending `afterClusterTime`, so the failure appears on the first **resume** —
+> in practice, during a failover.
+>
+> `sessionOptsForFlavor` now sets `SetCausalConsistency(false)` for DocumentDB,
+> applied at all four `StartSession` sites. The two in `compare.go` had
+> survived only because each session is short-lived enough never to reach a
+> second operation; a retry inside one would have hit the same wall.
+>
+> Nothing is lost by disabling it: the verifier never relied on causal
+> consistency against DocumentDB. Read ordering comes from opening the change
+> reader before any scan and trusting the primary's read-after-write guarantee
+> (Q1).
+
+### Q30. The drain must not require idleness — **CLUSTER** (5.0.0, 2026-09-01) — fixed
+
+> **The step-5 drain hung when writes continued past writes-off.**
+>
+> Q22's original confirmation was run against a quiesced source, where the
+> quiescence rule works. With a writer still running, the stream never goes
+> idle, so the drain waited indefinitely — observed hanging for over three
+> minutes until the writer was killed, at which point it completed normally.
+>
+> MongoDB's drain does not have this problem: it stops once the resume token
+> passes the fence, regardless of ongoing writes.
+>
+> `drainDocumentDBUntilQuiesced` now terminates on either condition:
+>
+> 1. **An event at or past the fence has been consumed.** The stream delivers
+>    in order, so everything before the fence is necessarily consumed too.
+>    This is the same reasoning MongoDB uses with the resume token.
+> 2. The original idle rule, for a genuinely quiet stream where no event will
+>    ever cross the fence.
+>
+> Re-tested with a writer running through writes-off: the drain now terminates
+> in the same second via condition 1.
+
 ---
 
 ## Priority 3 — nice to confirm
@@ -684,7 +822,16 @@ requirement.
 returns one and note what it reports per engine version, since our version
 gates read it.
 
-### Q18. Retention is not readable over the wire — **OPEN**
+### Q18. Retention is not readable over the wire — **CLUSTER** (5.0.0, 2026-09-01) — confirmed unreadable
+
+> **Confirmed.** `getParameter` is not implemented at all:
+> `Feature not supported: getParameter`, for `{getParameter: "*"}` and for
+> named lookups of `change_stream_log_retention_duration` in either
+> snake_case or camelCase.
+>
+> So `change_stream_log_retention_duration` genuinely cannot be read from a
+> MongoDB connection, and `warnDocumentDBChangeStreamRetention` is right to
+> emit an unconditional advisory rather than pretend to check.
 
 `change_stream_log_retention_duration` lives in a DB cluster parameter group.
 We currently emit an unconditional advisory

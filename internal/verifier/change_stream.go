@@ -463,8 +463,31 @@ func (csr *ChangeStreamReader) drainDocumentDBUntilQuiesced(
 			idlePolls = 0
 		}
 
+		// If we have consumed an event at or after the fence, then every
+		// event before the fence has necessarily been consumed too, because
+		// the stream delivers in order. That is the same reasoning MongoDB's
+		// drain uses with the resume token, and it needs no idleness.
+		//
+		// Without this, the drain waits for a lull that may never come: if
+		// writes continue past writesOff, the stream never goes idle and the
+		// drain hangs indefinitely. Observed in testing — a writer left
+		// running kept the drain alive for over three minutes until it was
+		// stopped.
+		if eventTs, has := csr.lastChangeEventTime.Load().Get(); has &&
+			!eventTs.Before(writesOffTs) {
+
+			csr.logger.Debug().
+				Any("lastEventTimestamp", eventTs).
+				Any("writesOffTimestamp", writesOffTs).
+				Msgf("%s consumed an event at or past the writesOff timestamp. Shutting down.", csr)
+
+			return eventTs, nil
+		}
+
 		// updateLastSeenClusterTime stores the session’s operationTime on
-		// every batch, so this advances even while no events arrive.
+		// every batch, so this advances even while no events arrive. This is
+		// the idle path: no event will ever cross the fence because nothing is
+		// being written.
 		serverTs, hasServerTs := csr.lastSeenClusterTime.Load().Get()
 
 		pastFence := hasServerTs && !serverTs.Before(writesOffTs)
