@@ -1685,7 +1685,15 @@ func (verifier *Verifier) partitionCollection(
 
 	switch schemeToUse {
 	case partitions.SchemeID:
-		if verifier.srcHasSampleRate() {
+		if verifier.srcIsDocumentDB() {
+			// DocumentDB supports neither $sampleRate nor $bucketAuto, so
+			// both of the MongoDB partitioners below are unavailable.
+			var err error
+			partitionsCount, err = verifier.createPartitionTasksWithIndexWalk(ctx, task, shardKeyFields)
+			if err != nil {
+				return errors.Wrapf(err, "partitioning %#q by index walk", srcNs)
+			}
+		} else if verifier.srcHasSampleRate() {
 			var err error
 			partitionsCount, err = verifier.createPartitionTasksWithSampleRate(ctx, task, shardKeyFields)
 			if err != nil {
@@ -1717,6 +1725,14 @@ func (verifier *Verifier) partitionCollection(
 			}
 		}
 	case partitions.SchemeNatural:
+		if verifier.srcIsDocumentDB() {
+			return docDBUnsupported(
+				"natural-order partitioning",
+				"DocumentDB has no $natural ordering",
+				string(partitions.SchemeID)+" partitioning",
+			)
+		}
+
 		clusterInfo, err := util.GetClusterInfo(ctx, verifier.logger, verifier.srcClient)
 		if err != nil {
 			return errors.Wrapf(err, "reading source cluster info")
