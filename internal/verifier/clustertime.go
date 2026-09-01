@@ -11,17 +11,26 @@ import (
 	"github.com/pkg/errors"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
 )
 
 const opTimeKeyInServerResponse = "operationTime"
 
 // GetNewClusterTime creates a new cluster time, updates all shards’
 // cluster times to meet or exceed that time, then returns it.
+//
+// DocumentDB implements neither appendOplogNote nor cluster time, so there we
+// read the server’s operationTime instead. See getDocumentDBServerTime.
 func GetNewClusterTime(
 	ctx context.Context,
 	logger *logger.Logger,
 	client *mongo.Client,
+	flavor util.Flavor,
 ) (bson.Timestamp, error) {
+	if flavor.IsDocumentDB() {
+		return getDocumentDBServerTime(ctx, logger, client)
+	}
+
 	var clusterTime bson.Timestamp
 
 	// First we just fetch the latest cluster time among all shards without
@@ -117,4 +126,49 @@ func getOpTimeFromRawResponse(rawResponse bson.Raw) (bson.Timestamp, error) {
 	}
 
 	return optime, nil
+}
+
+// getDocumentDBServerTime returns the server’s current operationTime.
+//
+// It stands in for appendOplogNote, which DocumentDB does not implement. Where
+// appendOplogNote actively advances the oplog and returns the resulting time,
+// this only observes the clock, so it is a weaker primitive: it tells us the
+// server has reached time T, not that every replica has.
+//
+// That is sufficient for the writes-off fence, whose only requirement is a T
+// that follows every write. Once the caller has stopped writing, any
+// subsequently observed operationTime satisfies that.
+func getDocumentDBServerTime(
+	ctx context.Context,
+	logger *logger.Logger,
+	client *mongo.Client,
+) (bson.Timestamp, error) {
+	var serverTime bson.Timestamp
+
+	err := retry.New().WithCallback(
+		func(ctx context.Context, _ *retry.FuncInfo) error {
+			raw, err := util.GetHelloRaw(ctx, client, option.None[*readpref.ReadPref]())
+			if err != nil {
+				return errors.Wrap(err, "running hello to read server time")
+			}
+
+			serverTime, err = getOpTimeFromRawResponse(raw)
+
+			return err
+		},
+		"reading DocumentDB server time",
+	).Run(ctx, logger)
+
+	if err != nil {
+		return bson.Timestamp{}, errors.Wrap(
+			err,
+			"failed to read DocumentDB's operation time, which stands in for a cluster time",
+		)
+	}
+
+	logger.Debug().
+		Any("operationTime", serverTime).
+		Msg("Read DocumentDB server time.")
+
+	return serverTime, nil
 }

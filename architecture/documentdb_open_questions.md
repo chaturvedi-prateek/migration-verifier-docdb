@@ -97,12 +97,18 @@ distinguishable error rather than silently starting from somewhere else.
 **Why it matters.** Retention defaults to 3 hours. If the verifier restarts
 after a longer outage and the resume silently succeeds from a later point,
 there is an unobserved gap in the change stream and the verification is void.
-We must hard-fail and force a restart from generation 0. This gate is not yet
-implemented; it belongs with step 5.
+
+**Implemented in step 5, but on a guess.** `util.IsChangeStreamHistoryLostError`
+now aborts the run with an instruction to restart using `--clean`. It matches
+MongoDB's code 286 plus several conventional message phrasings, because
+DocumentDB's actual code and wording are undocumented. **If DocumentDB uses
+neither, this gate silently fails open** — the worst outcome in this file. This
+is the single highest-value item to confirm.
 
 **How to check.** Set `change_stream_log_retention_duration` to its 1-hour
 minimum, capture a token, wait out the window, and attempt `resumeAfter`.
-Record the exact error code and message.
+Record the exact error code and message, then add them to
+`IsChangeStreamHistoryLostError`.
 
 ### Q5. `$listChangeStreams` works via the driver's `Database.Aggregate` — **OPEN**
 
@@ -334,6 +340,53 @@ db.getSiblingDB("config").collections.findOne({_id: "somedb.somecoll"})
 ```
 
 Expected: `null`, not an error.
+
+### Q21. `hello` returns `operationTime` — **OPEN**
+
+**Assumption.** DocumentDB's `hello` reply carries a top-level `operationTime`.
+
+**Why it matters.** `getDocumentDBServerTime` reads it to produce the
+writes-off fence, standing in for `appendOplogNote`. If `hello` omits it,
+`WritesOff` fails and no verification can reach a final generation. This is
+narrower than Q7, which asks only whether *some* command returns it — here we
+depend on a specific one.
+
+Note that `GetHelloRaw` previously *required* `operationTime` whenever the
+reply advertised `me`, which DocumentDB does. That check is now scoped to
+servers that also gossip `$clusterTime`, so it no longer rejects DocumentDB
+outright — but it means we no longer learn early whether `hello` carries the
+field.
+
+**How to check.**
+
+```js
+db.adminCommand({hello: 1}).operationTime   // expect a Timestamp, not undefined
+```
+
+If absent, find a command that does return one (`dbStats`, `find`, …) and use
+that in `getDocumentDBServerTime` instead.
+
+### Q22. The quiescence drain terminates correctly — **OPEN**
+
+**Assumption.** After writes stop, `operationTime` advances past the fence and
+the change stream returns `docDBDrainIdlePolls` consecutive empty batches
+within a reasonable time.
+
+**Why it matters.** `drainDocumentDBUntilQuiesced` replaces MongoDB's exact
+resume-token comparison, which DocumentDB cannot support. It infers "no more
+events" from "no events lately", so it is inherently weaker. Two failure
+modes: if `operationTime` never advances while idle, the drain hangs; if
+DocumentDB can deliver an event *after* several empty polls, the drain could
+end early and drop rechecks.
+
+Recall that AWS documents a long-running `updateMany`/`deleteMany` as able to
+"temporarily stall the writing of change streams events" — exactly the shape
+that could produce a deceptive lull.
+
+**How to check.** Run a verification under write load, stop the writes, call
+`WritesOff`, and confirm the drain ends promptly and that the event count it
+saw matches the writes performed. Repeat with a large `updateMany` in flight
+at writes-off time.
 
 ---
 

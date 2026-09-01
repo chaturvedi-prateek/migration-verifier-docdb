@@ -1,6 +1,7 @@
 package verifier
 
 import (
+	"github.com/10gen/migration-verifier/internal/util"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 )
@@ -24,7 +25,7 @@ func (suite *IntegrationTestSuite) TestGetNewClusterTime() {
 	clusterT, clusterI, ok := clusterTimeVal.TimestampOK()
 	suite.Require().True(ok, "session cluster time (%s: %v) must be a timestamp", clusterTimeVal.Type, clusterTimeVal)
 
-	ts, err := GetNewClusterTime(ctx, logger, suite.srcMongoClient)
+	ts, err := GetNewClusterTime(ctx, logger, suite.srcMongoClient, util.FlavorMongoDB)
 	suite.Require().NoError(err)
 
 	suite.Require().NotZero(ts, "timestamp should be nonzero")

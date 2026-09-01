@@ -364,6 +364,7 @@ func (verifier *Verifier) WritesOff(ctx context.Context) error {
 			ctx,
 			verifier.logger,
 			verifier.srcClient,
+			verifier.srcClusterInfo.Flavor,
 		)
 		if err != nil {
 			return errors.Wrapf(err, "failed to fetch source's cluster time")
@@ -373,6 +374,7 @@ func (verifier *Verifier) WritesOff(ctx context.Context) error {
 			ctx,
 			verifier.logger,
 			verifier.dstClient,
+			verifier.dstClusterInfo.Flavor,
 		)
 		if err != nil {
 			return errors.Wrapf(err, "failed to fetch destination's cluster time")

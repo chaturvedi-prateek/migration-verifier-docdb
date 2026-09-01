@@ -175,11 +175,13 @@ func (csr *ChangeStreamReader) GetChangeStreamFilter() (pipeline mongo.Pipeline)
 // the verifier will enqueue rechecks from those post-writesOff events. This
 // is unideal but shouldn’t impede correctness since post-writesOff events
 // shouldn’t really happen anyway by definition.
+// readAndHandleOneChangeEventBatch returns the number of events it read, which
+// the DocumentDB writes-off drain uses to detect a quiesced stream.
 func (csr *ChangeStreamReader) readAndHandleOneChangeEventBatch(
 	sctx context.Context,
 	ri retry.SuccessNotifier,
 	cs *mongo.ChangeStream,
-) error {
+) (int, error) {
 	eventsRead := 0
 	var changeEvents []ParsedEvent
 
@@ -190,7 +192,7 @@ func (csr *ChangeStreamReader) readAndHandleOneChangeEventBatch(
 		gotEvent := cs.TryNext(sctx)
 
 		if cs.Err() != nil {
-			return errors.Wrap(cs.Err(), "change stream iteration failed")
+			return 0, errors.Wrap(cs.Err(), "change stream iteration failed")
 		}
 
 		if !gotEvent {
@@ -208,7 +210,7 @@ func (csr *ChangeStreamReader) readAndHandleOneChangeEventBatch(
 		batchTotalBytes += len(cs.Current)
 
 		if err := (&changeEvents[eventsRead]).UnmarshalFromBSON(cs.Current); err != nil {
-			return errors.Wrapf(err, "failed to decode change event to %T", changeEvents[eventsRead])
+			return 0, errors.Wrapf(err, "failed to decode change event to %T", changeEvents[eventsRead])
 		}
 
 		// This only logs in tests.
@@ -229,7 +231,7 @@ func (csr *ChangeStreamReader) readAndHandleOneChangeEventBatch(
 				// Source in warnMost mode: warn and fall through to count it.
 				csr.warnSourceDDL(cs.Current)
 			} else {
-				return UnknownEventError{
+				return 0, UnknownEventError{
 					Event:             clone.Clone(cs.Current),
 					AllowedInWarnMost: allowedSrcDDLOpTypes.Contains(opType),
 				}
@@ -238,7 +240,7 @@ func (csr *ChangeStreamReader) readAndHandleOneChangeEventBatch(
 
 		// This shouldn’t happen, but just in case:
 		if changeEvents[eventsRead].Ns == nil {
-			return errors.Errorf("Change event lacks a namespace: %+v", changeEvents[eventsRead])
+			return 0, errors.Errorf("Change event lacks a namespace: %+v", changeEvents[eventsRead])
 		}
 
 		eventTime := changeEvents[eventsRead].ClusterTime
@@ -267,7 +269,7 @@ func (csr *ChangeStreamReader) readAndHandleOneChangeEventBatch(
 	// even with 0 events there is still a new resume token.
 	select {
 	case <-sctx.Done():
-		return util.WrapCtxErrWithCause(sctx)
+		return 0, util.WrapCtxErrWithCause(sctx)
 	case csr.eventBatchChan <- eventBatch{
 		events:      changeEvents,
 		resumeToken: cs.ResumeToken(),
@@ -276,7 +278,7 @@ func (csr *ChangeStreamReader) readAndHandleOneChangeEventBatch(
 
 	ri.NoteSuccess("sent %d-event batch to handler", len(changeEvents))
 
-	return nil
+	return eventsRead, nil
 }
 
 func (csr *ChangeStreamReader) iterateChangeStream(
@@ -318,26 +320,27 @@ changeStreamLoop:
 				Any("writesOffTimestamp", writesOffTs).
 				Msgf("%s received writesOff timestamp. Finalizing change stream.", csr)
 
-			// The drain below compares the reader’s consumed-up-to position
-			// against writesOffTs. On MongoDB the resume token supplies that
-			// position exactly. DocumentDB has no equivalent: its token is
-			// opaque, the last event’s clusterTime stalls once events stop
-			// (looping forever), and the server’s operationTime means “the
-			// server has advanced to T”, not “this reader has consumed up to
-			// T” — using it could end the drain while events are still
-			// undelivered, which would silently drop rechecks.
+			// DocumentDB provides no consumed-up-to marker. Its resume token
+			// is opaque, the last event’s clusterTime stalls once events stop,
+			// and operationTime means “the server reached T”, not “this reader
+			// consumed up to T”. So instead of comparing positions we drain to
+			// quiescence: keep reading until the server’s clock has passed the
+			// fence and the stream has gone idle for several consecutive
+			// polls.
 			//
-			// Rather than approximate it, we stop. Draining DocumentDB
-			// correctly needs its own termination rule (drain until getMore
-			// returns empty for N consecutive polls past writesOffTs).
+			// This is weaker than MongoDB’s exact comparison — it infers “no
+			// more events” from “no events lately” — so it is deliberately
+			// conservative, requiring both conditions before stopping.
 			if csr.clusterInfo.Flavor.IsDocumentDB() {
-				return errors.Errorf(
-					"cannot finalize a DocumentDB change stream: %s has no resume-token timestamp "+
-						"to compare against the writes-off timestamp (%v), and no safe substitute "+
-						"is implemented yet",
-					csr,
-					writesOffTs,
-				)
+				finalTs, err := csr.drainDocumentDBUntilQuiesced(sctx, ri, cs, writesOffTs)
+				if err != nil {
+					return err
+				}
+
+				csr.running = false
+				csr.startAtTS = &finalTs
+
+				break changeStreamLoop
 			}
 
 			// Read change events until the stream reaches the writesOffTs.
@@ -363,14 +366,14 @@ changeStreamLoop:
 					break changeStreamLoop
 				}
 
-				err = csr.readAndHandleOneChangeEventBatch(sctx, ri, cs)
+				_, err = csr.readAndHandleOneChangeEventBatch(sctx, ri, cs)
 				if err != nil {
 					return errors.Wrap(err, "finishing change stream after writes-off")
 				}
 			}
 
 		default:
-			err = csr.readAndHandleOneChangeEventBatch(sctx, ri, cs)
+			_, err = csr.readAndHandleOneChangeEventBatch(sctx, ri, cs)
 			if err != nil {
 				return err
 			}
@@ -389,6 +392,76 @@ changeStreamLoop:
 		Msg("Change stream reader is done.")
 
 	return nil
+}
+
+// docDBDrainIdlePolls is how many consecutive empty batches, past the
+// writes-off fence, we treat as proof that a DocumentDB change stream has
+// nothing left to deliver. Each empty poll costs up to maxChangeStreamAwaitTime,
+// so this trades a few seconds at shutdown for confidence that no event was
+// left behind.
+const docDBDrainIdlePolls = 3
+
+// drainDocumentDBUntilQuiesced reads a DocumentDB change stream until it has
+// certainly delivered every event up to writesOffTs, then returns the
+// timestamp reached.
+//
+// Termination requires two independent conditions:
+//
+//   - The server’s own clock, as reported by operationTime on each response,
+//     has reached writesOffTs. Until then the fence simply hasn’t been passed.
+//   - The stream has returned no events for docDBDrainIdlePolls consecutive
+//     polls, which is our evidence that nothing remains in flight.
+//
+// Requiring both matters. The clock alone would let us stop while events at or
+// before the fence were still undelivered; idleness alone could be satisfied by
+// a momentary lull long before the fence.
+func (csr *ChangeStreamReader) drainDocumentDBUntilQuiesced(
+	sctx context.Context,
+	ri retry.SuccessNotifier,
+	cs *mongo.ChangeStream,
+	writesOffTs bson.Timestamp,
+) (bson.Timestamp, error) {
+	csr.logger.Debug().
+		Any("writesOffTimestamp", writesOffTs).
+		Int("requiredIdlePolls", docDBDrainIdlePolls).
+		Msgf("%s draining to quiescence.", csr)
+
+	idlePolls := 0
+
+	for {
+		eventsRead, err := csr.readAndHandleOneChangeEventBatch(sctx, ri, cs)
+		if err != nil {
+			return bson.Timestamp{}, errors.Wrap(err, "finishing change stream after writes-off")
+		}
+
+		if eventsRead == 0 {
+			idlePolls++
+		} else {
+			idlePolls = 0
+		}
+
+		// updateLastSeenClusterTime stores the session’s operationTime on
+		// every batch, so this advances even while no events arrive.
+		serverTs, hasServerTs := csr.lastSeenClusterTime.Load().Get()
+
+		pastFence := hasServerTs && !serverTs.Before(writesOffTs)
+
+		if pastFence && idlePolls >= docDBDrainIdlePolls {
+			csr.logger.Debug().
+				Any("serverTimestamp", serverTs).
+				Any("writesOffTimestamp", writesOffTs).
+				Int("idlePolls", idlePolls).
+				Msgf("%s has drained past the writesOff timestamp. Shutting down.", csr)
+
+			return serverTs, nil
+		}
+
+		select {
+		case <-sctx.Done():
+			return bson.Timestamp{}, util.WrapCtxErrWithCause(sctx)
+		default:
+		}
+	}
 }
 
 func (csr *ChangeStreamReader) createChangeStream(
@@ -455,6 +528,27 @@ func (csr *ChangeStreamReader) createChangeStream(
 
 	changeStream, err := csr.watcherClient.Watch(sctx, pipeline, opts)
 	if err != nil {
+		// A resume that fails because the history is gone must not be retried
+		// or worked around: every change between the token and now went
+		// unobserved, so any rechecks they would have produced are lost and
+		// the verification can no longer be trusted. The run has to restart
+		// from a full scan.
+		//
+		// DocumentDB makes this a realistic operational event rather than an
+		// edge case: it retains change stream events for only 3 hours by
+		// default, so an interrupted verification can outlive its own token.
+		if hasSavedToken && util.IsChangeStreamHistoryLostError(err) {
+			return bson.Timestamp{}, errors.Wrapf(
+				err,
+				"%s cannot resume from its persisted token: the server no longer retains "+
+					"that point in its change stream history, so changes since then were never "+
+					"observed and this verification cannot be trusted. Restart it with %#q. "+
+					"To make this less likely, raise the cluster's change stream retention",
+				csr,
+				"--"+mvflags.CleanFlag,
+			)
+		}
+
 		return bson.Timestamp{}, errors.Wrap(err, "opening change stream")
 	}
 

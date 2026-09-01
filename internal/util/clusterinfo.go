@@ -240,7 +240,14 @@ func GetHelloRaw(
 	//
 	// We check for “me” to avoid failing if the cluster is a standalone,
 	// in which case the hello response legitimately lacks an operationTime.
-	if err == nil && !raw.Lookup("me").IsZero() {
+	//
+	// We also require $clusterTime, which every MongoDB replica set gossips.
+	// This scopes the check to the MongoDB replica sets the referenced bug
+	// applies to, and keeps it from firing on DocumentDB, which advertises
+	// “me” but gossips no cluster time. Without that guard this check would
+	// reject every DocumentDB cluster with a misleading instruction to force
+	// an election.
+	if err == nil && !raw.Lookup("me").IsZero() && !raw.Lookup("$clusterTime").IsZero() {
 		const opTimeName = "operationTime"
 		_, err := raw.LookupErr(opTimeName)
 		if err != nil {

@@ -51,7 +51,7 @@ const (
 	metaDBName            = "metaDBName"
 	docCompareMethod      = "docCompareMethod"
 	verifyAll             = "verifyAll"
-	startClean            = "clean"
+	startClean            = mvflags.CleanFlag
 	readPreference        = "readPreference"
 	partitionSizeMB       = "partitionSizeMB"
 	checkOnly             = "checkOnly"

@@ -555,3 +555,44 @@ func TolerateSimpleDuplicateKeyInBulk(
 
 	return err
 }
+
+// changeStreamHistoryLostErrCode is MongoDB's ChangeStreamHistoryLost. The
+// server returns it when a resume token predates the oldest available oplog
+// entry, so the stream cannot be resumed without a gap.
+const changeStreamHistoryLostErrCode = 286
+
+// IsChangeStreamHistoryLostError reports whether resuming a change stream
+// failed because the requested resume point is no longer retained.
+//
+// This matters far more against DocumentDB than MongoDB: DocumentDB retains
+// change stream events for only 3 hours by default (7 days maximum), so an
+// interrupted verification can easily outlive its own resume token. Resuming
+// past that point would leave an unobserved window of changes, which would
+// silently invalidate the verification.
+//
+// DocumentDB's error code for this is not documented, so we also match on the
+// message text that server implementations conventionally use.
+func IsChangeStreamHistoryLostError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	if GetErrorCode(err) == changeStreamHistoryLostErrCode {
+		return true
+	}
+
+	lowered := strings.ToLower(err.Error())
+
+	for _, phrase := range []string{
+		"changestreamhistorylost",
+		"resume point may no longer be in the oplog",
+		"resume token was not found",
+		"resume of change stream was not possible",
+	} {
+		if strings.Contains(lowered, phrase) {
+			return true
+		}
+	}
+
+	return false
+}

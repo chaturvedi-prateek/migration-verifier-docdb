@@ -380,10 +380,14 @@ func (verifier *Verifier) GenerateRecheckTasks(
 		// guarantee that all previously-written, majority-committed writes will
 		// be visible in the session, and thus that we see all rechecks enqueued
 		// up to this point.
+		// The metadata cluster is always MongoDB; SetMetaURI rejects
+		// DocumentDB precisely because this causally-consistent read needs a
+		// cluster time.
 		_, err = GetNewClusterTime(
 			findCtx,
 			verifier.logger,
 			recheckColl.Database().Client(),
+			verifier.metaClusterInfo.Flavor,
 		)
 		if err != nil {
 			return errors.Wrap(err, "bootstrapping causally-consistent session for generating recheck tasks")
