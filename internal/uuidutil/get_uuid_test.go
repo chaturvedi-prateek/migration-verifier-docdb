@@ -47,26 +47,38 @@ func TestGetCollectionUUID_NilUUIDReturnsError(t *testing.T) {
 	_, err = db.Collection("real").InsertOne(ctx, bson.D{{"_id", 1}})
 	require.NoError(t, err)
 
-	require.NoError(t, db.CreateView(ctx, "aview", "real", mongo.Pipeline{}))
-
 	log := logger.NewDefaultLogger()
 
-	t.Run("a real collection yields its UUID", func(t *testing.T) {
-		uuid, err := GetCollectionUUID(ctx, log, db, "real")
+	// Whether a plain collection has a UUID is a server-behavior difference,
+	// not a test parameter: MongoDB reports one, DocumentDB does not. Branch on
+	// what this server actually did so the test is meaningful against both.
+	uuid, err := GetCollectionUUID(ctx, log, db, "real")
 
-		require.NoError(t, err)
-		require.NotNil(t, uuid)
-	})
-
-	t.Run("a view yields an error rather than panicking", func(t *testing.T) {
-		assert.NotPanics(t, func() {
-			uuid, err := GetCollectionUUID(ctx, log, db, "aview")
-
-			require.Error(t, err, "a view has no UUID")
+	if err != nil {
+		t.Run("a server without collection UUIDs errors rather than exiting", func(t *testing.T) {
 			assert.Nil(t, uuid)
 			assert.ErrorContains(t, err, "UUID")
+			t.Logf("server reports no collection UUIDs: %v", err)
 		})
-	})
+	} else {
+		require.NotNil(t, uuid, "a successful lookup must return a UUID")
+
+		// Views have no UUID, which is the other route to a nil UUID. Only
+		// MongoDB supports them; DocumentDB rejects the create.
+		t.Run("a view yields an error rather than panicking", func(t *testing.T) {
+			if err := db.CreateView(ctx, "aview", "real", mongo.Pipeline{}); err != nil {
+				t.Skipf("server does not support views: %v", err)
+			}
+
+			assert.NotPanics(t, func() {
+				uuid, err := GetCollectionUUID(ctx, log, db, "aview")
+
+				require.Error(t, err, "a view has no UUID")
+				assert.Nil(t, uuid)
+				assert.ErrorContains(t, err, "UUID")
+			})
+		})
+	}
 
 	t.Run("a missing collection yields an error", func(t *testing.T) {
 		_, err := GetCollectionUUID(ctx, log, db, "nonexistent")

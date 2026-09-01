@@ -15,6 +15,42 @@ whenever DocumentDB work depends on behavior we haven't observed directly.
 An item is only done when it reaches **CLUSTER**, because DocumentDB emulates
 MongoDB's wire protocol: a thing can look supported and behave differently.
 
+## Results: DocumentDB 5.0.0, 2026-09-01
+
+Run via `documentdb_probe.js` against `maruti-poc-docdb-cluster`
+(engine 5.0.0, `versionArray [5,0,0,0]`, `setName rs0`, ap-south-1).
+
+Confirmed working as designed: **Q1, Q5, Q6, Q7, Q9, Q11, Q13, Q17, Q20, Q21**.
+
+Most importantly, **Q1 held**: 300/300 writes were immediately visible to a
+following primary read. The live-verification design rests on that, so it is
+no longer an assumption.
+
+**Q12 confirmed the negative**: `listCollections` reports no `info.uuid`, so
+the step-6 fix from `Fatal()` to a returned error was necessary.
+
+**Q13 resolved better than expected**: DocumentDB rejects capped collections
+outright (`Feature not supported: capped:true`), so the whole capped-vs-
+`$natural` problem cannot arise.
+
+**Q10 confirmed covered**: DocumentDB plans the partitioner's boundary query
+as `LIMIT_SKIP -> IXONLYSCAN`, an index-only scan. The first probe run reported
+this as a FAIL only because DocumentDB's explain has no `totalDocsExamined`
+counter; the probe now reads the stage name instead.
+
+Real code exercised successfully against this cluster:
+`TestFindNextIDBoundary` (the index-walk partitioner), `TestGetCollectionUUID`
+(the step-6 fix, which returned a clean error rather than `os.Exit(1)`), and
+`TestFlavorAgainstLiveServer` (detection, `GetClusterInfo`, the
+`operationTime` timestamp path, and the `--srcFlavor` override).
+
+**Second run, change streams enabled** (scoped to the probe database, then
+disabled again): **14 pass, 0 fail.** Q2, Q3, Q15 all confirmed.
+
+Still open: **Q4** (resume expiry — needs a timed retention test), **Q8**
+(failover), **Q14** (full change stream pipeline), **Q16** (DDL event types),
+**Q22** (drain termination). **Q23** and **Q24** need code.
+
 ## Prerequisites for checking these
 
 Most checks need a DocumentDB cluster with change streams enabled and a
@@ -34,7 +70,10 @@ streams from the primary, and the verifier requires primary reads regardless
 
 ## Priority 1 — correctness. Wrong answers here mean a false "clusters match".
 
-### Q1. Primary reads are read-after-write consistent — **DOC**
+### Q1. Primary reads are read-after-write consistent — **CLUSTER** (5.0.0, 2026-09-01)
+
+> **Confirmed.** 300/300 documents were visible to an immediately following
+> primary read. The consistency substitution in `compare.go` is sound.
 
 **Assumption.** A read issued to the DocumentDB primary observes every write
 acknowledged before that read began.
@@ -54,7 +93,15 @@ consistency"; reads from the primary are "strongly consistent."
 connection with `readPreference=primary`, in a tight loop across a few thousand
 iterations. Any miss falsifies the design.
 
-### Q2. Change events always carry `clusterTime` — **DOC**
+### Q2. Change events always carry `clusterTime` — **CLUSTER** (5.0.0, 2026-09-01)
+
+> **Confirmed.** A real insert event carried keys
+> `_id, operationType, clusterTime, ns, documentKey, fullDocument`, with
+> `clusterTime` a Timestamp. The per-event timestamp the recheck ordering and
+> the drain depend on is present.
+>
+> Note `updateDescription` is absent, matching AWS's documented divergence.
+> Our change stream pipeline removes that field anyway.
 
 **Assumption.** Every change event document includes a `clusterTime` BSON
 timestamp.
@@ -70,7 +117,16 @@ on insert and update events.
 **How to check.** Watch a collection, generate insert/update/delete/replace
 events, and confirm `clusterTime` is present and non-zero on each.
 
-### Q3. Resume token `_data` is not a MongoDB KeyString — **DOC**
+### Q3. Resume token `_data` is not a MongoDB KeyString — **CLUSTER** (5.0.0, 2026-09-01)
+
+> **Confirmed, decisively.** A captured token,
+> `{"_data": "016a96c50200000009010000000000004324"}`, is rejected by our own
+> decoder with `unknown keystring ctype 106`. That token is now pinned in
+> `internal/keystring/docdb_token_test.go`.
+>
+> So `positionTimestamp` routing DocumentDB away from
+> `extractTSFromChangeStreamResumeToken` is required, not defensive: decoding
+> would fail outright.
 
 **Assumption.** `extractTSFromChangeStreamResumeToken` (`change_stream.go:500`)
 cannot decode a DocumentDB token, so we must not call it.
@@ -110,7 +166,10 @@ minimum, capture a token, wait out the window, and attempt `resumeAfter`.
 Record the exact error code and message, then add them to
 `IsChangeStreamHistoryLostError`.
 
-### Q5. `$listChangeStreams` works via the driver's `Database.Aggregate` — **OPEN**
+### Q5. `$listChangeStreams` works via the driver's `Database.Aggregate` — **CLUSTER** (5.0.0, 2026-09-01)
+
+> **Confirmed.** The stage runs and returns an empty result set when nothing is
+> enabled, which is exactly what Gate A needs in order to fail closed.
 
 **Assumption.** `admin.aggregate([{$listChangeStreams: 1}])` as issued by
 `listEnabledChangeStreams` (`documentdb.go`) returns the enabled scopes.
@@ -128,7 +187,10 @@ unusable, so we need to know.
 **How to check.** Enable change streams at collection, database, and cluster
 scope in turn, and confirm each shows up with the documented field names.
 
-### Q6. `readConcern: {level: "majority"}` is accepted — **OPEN**
+### Q6. `readConcern: {level: "majority"}` is accepted — **CLUSTER** (5.0.0, 2026-09-01)
+
+> **Confirmed accepted.** No change needed: `buildClientOpts` can keep setting
+> majority for DocumentDB connections.
 
 **Assumption.** DocumentDB tolerates the majority read concern that
 `buildClientOpts` sets (`migration_verifier.go:304`).
@@ -146,7 +208,10 @@ rejects that, we must skip it for DocumentDB connections too.
 **How to check.** `db.coll.find().readConcern("majority")` and a raw `find`
 with an explicit `readConcern` document.
 
-### Q7. `operationTime` is present in command responses — **OPEN**
+### Q7. `operationTime` is present in command responses — **CLUSTER** (5.0.0, 2026-09-01)
+
+> **Confirmed.** `ping`, `dbStats`, and `listDatabases` all return it, as does
+> `hello` (Q21). Plenty of fallbacks if `hello` ever stops.
 
 **Assumption.** DocumentDB returns a top-level `operationTime` we can read to
 mint a server timestamp.
@@ -186,7 +251,12 @@ and no mismatches are missed.
 
 ## Priority 2 — behavior. Wrong answers mean crashes or bad performance.
 
-### Q9. Flavor detection is correct on a real cluster — **OPEN**
+### Q9. Flavor detection is correct on a real cluster — **CLUSTER** (5.0.0, 2026-09-01)
+
+> **Confirmed.** `hello` returned `me=...docdb.amazonaws.com:27017`,
+> `setName=rs0`, and no `$clusterTime` — precisely the signature
+> `flavorFromHello` keys on. Auto-detection identifies DocumentDB correctly;
+> `--srcFlavor` is not needed.
 
 **Assumption.** DocumentDB's `hello` advertises replica-set membership (`me`)
 but omits `$clusterTime`, which is how `flavorFromHello`
@@ -210,7 +280,19 @@ Expected for DocumentDB: `me` set, `$clusterTime` absent. (Verified on
 MongoDB's side: a standalone mongod has neither, which is why detection
 requires `me` before concluding DocumentDB.)
 
-### Q10. The `_id` index walk is a covered scan — **OPEN**
+### Q10. The `_id` index walk is a covered scan — **CLUSTER** (5.0.0, 2026-09-01)
+
+> **Confirmed covered.** DocumentDB plans the partition-boundary query as
+> `LIMIT_SKIP -> IXONLYSCAN` over `_id_`, where `IXONLYSCAN` is its index-only
+> scan — no documents are fetched. The IXONLYSCAN stage reported
+> `nReturned: 1000` (skip 999 + 1) in ~2 ms, and LIMIT_SKIP returned 1.
+>
+> DocumentDB's explain carries no `totalDocsExamined`/`keysExamined` counters
+> at all, which is why the first probe run read `undefined`; the stage name is
+> the evidence instead. The probe now recognises both shapes.
+>
+> `TestFindNextIDBoundary` also passes end-to-end against this cluster:
+> boundaries evenly spaced, full coverage, 1.8 s.
 
 **Assumption.** The partition-boundary query is served by an index-only scan
 that fetches no documents.
@@ -234,7 +316,10 @@ db.docs.find({_id: {$gt: <someId>}}, {_id: 1})
 
 Look for zero documents examined and roughly `skip + 1` keys examined.
 
-### Q11. `$collStats` returns usable size, count, and capped — **OPEN**
+### Q11. `$collStats` returns usable size, count, and capped — **CLUSTER** (5.0.0, 2026-09-01)
+
+> **Confirmed.** The exact pipeline from `partitions.go` returned
+> `count=5000 size=1230000`. Partition sizing works.
 
 **Assumption.** `partitions.GetSizeAndDocumentCount` works, including its
 `$group` with `$sum`, `$cond`, and `$first` over `$storageStats`.
@@ -249,7 +334,11 @@ its `latencyStats`, `recordStats`, and `queryExecStats` options. We use
 **How to check.** Run the exact pipeline from `partitions.go:329` and confirm
 non-zero `count` and `size`, and a correct `capped` flag.
 
-### Q12. `listCollections` omits `info.uuid` — **OPEN**
+### Q12. `listCollections` omits `info.uuid` — **CLUSTER** (5.0.0, 2026-09-01)
+
+> **Confirmed omitted.** The spec carried only `info: {readOnly: false}`. The
+> step-6 change from `logger.Fatal()` (an `os.Exit(1)`) to a returned error was
+> therefore required, not merely defensive.
 
 **Assumption.** DocumentDB does not return collection UUIDs.
 
@@ -266,7 +355,13 @@ process, but it still fails.
 **How to check.** `db.runCommand({listCollections: 1})` and look for
 `info.uuid` on a collection entry.
 
-### Q13. Capped collections — **OPEN**
+### Q13. Capped collections — **CLUSTER** (5.0.0, 2026-09-01) — moot
+
+> **Resolved by non-existence.** DocumentDB refuses to create them:
+> `Feature not supported: capped:true`. A DocumentDB source can therefore never
+> present a capped collection, so the `$natural`-ordering divergence described
+> below cannot arise. The handling in `partition_walk.go` is now unreachable
+> defensive code rather than an active trade-off.
 
 **Assumption.** Either DocumentDB has no capped collections, or comparing them
 in `_id` order is acceptable.
@@ -301,7 +396,12 @@ a DocumentDB 8.0 cluster. Both need to become flavor-aware.
 `GetChangeStreamFilter` and confirm it opens and yields correctly shaped
 events.
 
-### Q15. `startAfter` is unsupported; `startAtOperationTime` is — **DOC**
+### Q15. `startAfter` is unsupported; `startAtOperationTime` is — **CLUSTER** (5.0.0, 2026-09-01)
+
+> **Confirmed rejected**: `BSON field '$changeStream.startAfter' is an unknown
+> field.` The flavor gate added in step 4 is required — without it, every
+> resumed change stream against DocumentDB would fail, since DocumentDB reports
+> a version that clears `ClusterHasChangeStreamStartAfter`.
 
 **Assumption.** We must use `resumeAfter` or `startAtOperationTime`, never
 `startAfter`.
@@ -326,7 +426,10 @@ default `failAll`, aborts the run. If DocumentDB emits types we don't expect
 **How to check.** Create/drop collections and indexes while watching, and
 record every `operationType` observed.
 
-### Q20. `config.collections` is queryable (or absent, not forbidden) — **OPEN**
+### Q20. `config.collections` is queryable (or absent, not forbidden) — **CLUSTER** (5.0.0, 2026-09-01)
+
+> **Confirmed readable**, returning an empty result. `getShardKeyFields`
+> degrades to "not sharded" as intended, so partitioning is not blocked.
 
 **Assumption.** `sharding.GetShardKey` can run
 `config.collections.findOne({_id: "<ns>"})` against DocumentDB and get either
@@ -347,7 +450,11 @@ db.getSiblingDB("config").collections.findOne({_id: "somedb.somecoll"})
 
 Expected: `null`, not an error.
 
-### Q21. `hello` returns `operationTime` — **OPEN**
+### Q21. `hello` returns `operationTime` — **CLUSTER** (5.0.0, 2026-09-01)
+
+> **Confirmed.** `hello.operationTime` came back as a Timestamp. The
+> writes-off fence in `getDocumentDBServerTime` works as written, and the
+> per-batch warning path in `updateTimestamps` should never fire.
 
 **Assumption.** DocumentDB's `hello` reply carries a top-level `operationTime`.
 
@@ -400,11 +507,96 @@ that could produce a deceptive lull.
 saw matches the writes performed. Repeat with a large `updateMany` in flight
 at writes-off time.
 
+### Q23. Index specs carry a `ns` field — **CLUSTER** (5.0.0, 2026-09-01) — needs code
+
+> **Confirmed divergence.** DocumentDB reports index specs as
+> `{v: 2, key: {_id: 1}, name: "_id_", ns: "db.coll"}`. MongoDB **removed**
+> `ns` from index specs in 4.4, so a modern destination will not have it.
+
+`verifyIndexes` compares specs field by field via
+`index.DescribeSpecDifferences`, so **every index on every collection will
+report a spurious mismatch** on the `ns` field alone. Worse, `ns` holds the
+source namespace, so it cannot match a remapped destination even in principle.
+
+Needs either a DocumentDB-aware normalisation that strips `ns` before
+comparison, or a default `--indexSpecIgnore` entry for DocumentDB sources.
+
+### Q24. Collection options diverge structurally — **CLUSTER** (5.0.0, 2026-09-01) — needs code
+
+> **Confirmed divergence.** DocumentDB reported collection options as
+> `{autoIndexId: true, capped: false, storageEngine: {documentDB: {compression: {enable: false}}}}`.
+
+`compareCollectionSpecifications` does a `bytes.Equal` on the raw options and
+then a detailed field comparison, so **every collection will report a metadata
+mismatch**: `storageEngine.documentDB` is DocumentDB-specific and has no
+MongoDB counterpart, and `autoIndexId` is long removed from MongoDB.
+
+Needs a DocumentDB-aware normalisation of the options document before
+comparison — at minimum dropping `storageEngine` and `autoIndexId`, and
+treating `capped: false` as equivalent to absent.
+
+Note this is a false-*positive* class of failure: it reports mismatches that
+are not real, rather than hiding real ones. It makes output unusable, but it
+does not threaten correctness the way Q4 does.
+
+### Q25. The Go driver ignores `tlsAllowInvalidHostnames` — **CLUSTER** (5.0.0, 2026-09-01) — setup gotcha
+
+> **Confirmed.** The MongoDB Go driver v2 parses only `tlsInsecure`
+> (and its `sslInsecure` alias); it has no `tlsAllowInvalidHostnames` option.
+> Passing the mongosh-style URI to the verifier fails after a 60 s server-
+> selection timeout with:
+>
+> `tls: failed to verify certificate: x509: certificate is valid for
+> <cluster endpoints>, not localhost`
+
+So a tunnelled URI that works in `mongosh` does **not** work with the verifier.
+Two ways to fix it, in order of preference:
+
+1. **Map the hostname.** Add the cluster endpoint to `/etc/hosts` pointing at
+   `127.0.0.1` and use the real hostname in the URI. Certificate validation
+   then passes completely, with no TLS relaxation. The port may still differ
+   from 27017; certificates carry no port.
+2. **`tlsInsecure=true`.** Works, but disables certificate-chain *and*
+   hostname verification. Acceptable for local testing over an SSH tunnel that
+   already authenticates the endpoint; not something to document as the normal
+   path.
+
+### Q26. Views are unsupported — **CLUSTER** (5.0.0, 2026-09-01)
+
+> **Confirmed.** `createView` fails with
+> `Field 'pipeline' is currently not supported`.
+
+`compareCollectionSpecifications` branches on `srcSpec.Type == "view"`, which a
+DocumentDB source can never produce. Like Q13 (capped collections), this is a
+whole class of handling that cannot be exercised from a DocumentDB source.
+
+### Q27. Retryable writes are unsupported — **CLUSTER** (5.0.0, 2026-09-01)
+
+> **Confirmed.** Opening a change stream and writing on a `retryWrites=true`
+> connection fails with `Retryable writes are not supported`. AWS's own sample
+> code sets `retryWrites=false`.
+
+**No verifier change is needed today**, and the reason is worth recording: the
+verifier never writes to the source or the destination. It reads both and
+writes only to the metadata cluster, which Gate D already requires to be
+MongoDB. The one source write it used to perform, `appendOplogNote`, is now
+MongoDB-only.
+
+It does matter for anything else pointed at the cluster: add
+`retryWrites=false` to `mongosh` and to any tooling that writes. If the
+verifier ever gains a source or destination write, this becomes a real
+requirement.
+
 ---
 
 ## Priority 3 — nice to confirm
 
-### Q17. `buildInfo.versionArray` shape — **OPEN**
+### Q17. `buildInfo.versionArray` shape — **CLUSTER** (5.0.0, 2026-09-01)
+
+> **Confirmed.** `versionArray=[5,0,0,0]`, `version=5.0.0`. Four elements;
+> `GetVersionArray` copies into a `[3]int` and so takes `[5,0,0]`, which is
+> correct. Note this is exactly the misleading number that made the flavor axis
+> necessary — it clears every MongoDB 5.0 feature gate.
 
 `mmongo.GetVersionArray` requires a `versionArray` field. Confirm DocumentDB
 returns one and note what it reports per engine version, since our version
@@ -418,7 +610,7 @@ We currently emit an unconditional advisory
 a MongoDB connection. If one exists (some `getParameter` variant), we could
 turn the advisory into a real check.
 
-### Q19. Index specification comparison — **OPEN**
+### Q19. Index specification comparison — superseded by Q23
 
 `verifyIndexes` compares index specs field by field between clusters.
 DocumentDB may report different or additional spec fields than MongoDB for
