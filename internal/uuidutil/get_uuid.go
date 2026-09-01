@@ -2,7 +2,6 @@ package uuidutil
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/10gen/migration-verifier/internal/logger"
 	"github.com/10gen/migration-verifier/internal/retry"
@@ -58,12 +57,23 @@ func GetCollectionUUID(ctx context.Context, logger *logger.Logger, db *mongo.Dat
 	}
 
 	if len(collSpecs) != 1 {
-		fmt.Println("!!!")
-		fmt.Println(collName)
-		return nil, errors.Errorf("number of matching collections should be 1")
+		return nil, errors.Errorf(
+			"expected exactly 1 collection matching %#q, got %d",
+			db.Name()+"."+collName,
+			len(collSpecs),
+		)
 	}
 
-	util.Invariant(logger, collSpecs[0].UUID != nil, "Collection has nil UUID (most probably is a view): %v", collSpecs[0])
+	// A nil UUID is not a programming error, so it must not panic. It happens
+	// for views, which have no UUID, and for servers that do not report
+	// collection UUIDs at all — DocumentDB's listCollections omits info.uuid.
+	if collSpecs[0].UUID == nil {
+		return nil, errors.Errorf(
+			"%#q has no UUID (it may be a view, or the server may not report collection UUIDs): %v",
+			db.Name()+"."+collName,
+			collSpecs[0],
+		)
+	}
 
 	return collSpecs[0].UUID, nil
 }

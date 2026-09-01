@@ -253,9 +253,15 @@ non-zero `count` and `size`, and a correct `capped` flag.
 
 **Assumption.** DocumentDB does not return collection UUIDs.
 
-**Why it matters.** `uuidutil/get_uuid.go:66` has a hard invariant that the
-UUID is non-nil and **panics** otherwise, taking down the process. Scheduled
-for step 6.
+**Why it matters.** `GetCollectionUUID` used to assert a non-nil UUID via
+`util.Invariant`, which calls `logger.Fatal()` — an immediate `os.Exit(1)`,
+not even a recoverable panic. Step 6 replaced it with an error naming both
+causes (a view, or a server that does not report UUIDs). Verified against a
+real view on MongoDB.
+
+The answer still matters for diagnosis: if DocumentDB omits `info.uuid`, any
+code path needing a UUID now fails with a clear message instead of killing the
+process, but it still fails.
 
 **How to check.** `db.runCommand({listCollections: 1})` and look for
 `info.uuid` on a collection entry.
@@ -356,6 +362,12 @@ reply advertised `me`, which DocumentDB does. That check is now scoped to
 servers that also gossip `$clusterTime`, so it no longer rejects DocumentDB
 outright — but it means we no longer learn early whether `hello` carries the
 field.
+
+**Partly mitigated in step 6.** `updateTimestamps` used to panic on a nil
+`operationTime`; on DocumentDB it now warns once and continues, since those
+timestamps only feed lag reporting. So a missing `operationTime` degrades
+progress display rather than crashing — but `WritesOff` still fails outright,
+because the fence genuinely needs a server timestamp.
 
 **How to check.**
 

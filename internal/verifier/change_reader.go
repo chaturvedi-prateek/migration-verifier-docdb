@@ -3,6 +3,7 @@ package verifier
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/10gen/migration-verifier/history"
@@ -124,6 +125,12 @@ type ChangeReaderCommon struct {
 
 	onDDLEvent ddlEventHandling
 
+	// warnedNoOperationTime keeps the missing-operationTime warning to one
+	// line rather than one per batch. It is a pointer because
+	// ChangeReaderCommon is returned and copied by value, and a sync.Once may
+	// not be copied.
+	warnedNoOperationTime *sync.Once
+
 	// cumulativeEventCounts tallies all change events seen since the verifier
 	// first started. Unlike EventRecorder, this is never reset and is persisted
 	// alongside the resume token so it survives restarts.
@@ -162,6 +169,7 @@ func newChangeReaderCommon(clusterName whichCluster) ChangeReaderCommon {
 		lastChangeEventTime:   msync.NewTypedAtomic(option.None[bson.Timestamp]()),
 		lastSeenClusterTime:   msync.NewTypedAtomic(option.None[bson.Timestamp]()),
 		batchSizeHistory:      history.New[int](time.Minute),
+		warnedNoOperationTime: &sync.Once{},
 		cumulativeEventCounts: msync.NewDataGuard(api.ChangeEventCounts{}),
 	}
 }
@@ -413,6 +421,18 @@ func (rc *ChangeReaderCommon) positionTimestamp(token bson.Raw) (bson.Timestamp,
 
 func (rc *ChangeReaderCommon) persistResumeToken(ctx context.Context, token bson.Raw) error {
 	if len(token) == 0 {
+		// MongoDB always supplies a post-batch resume token, so an empty one
+		// there means we called this wrongly. Whether DocumentDB guarantees
+		// the same is not something we can assert, and this runs at startup,
+		// so report it rather than crashing the process.
+		if rc.clusterInfo.Flavor.IsDocumentDB() {
+			return errors.Errorf(
+				"%s received an empty resume token from the server; "+
+					"the change stream cannot be resumed without one",
+				rc.readerType,
+			)
+		}
+
 		panic("internal error: resume token is empty but should never be")
 	}
 
@@ -526,6 +546,22 @@ func (rc *ChangeReaderCommon) updateTimestamps(sess *mongo.Session, token bson.R
 	opTime := sess.OperationTime()
 
 	if opTime == nil {
+		// On MongoDB this is a genuine invariant: the session has always seen
+		// a response by now. DocumentDB is not guaranteed to report
+		// operationTime at all, and these timestamps only feed lag reporting,
+		// so crashing the verification over a missing progress metric would be
+		// wildly disproportionate. Warn once and carry on.
+		if rc.clusterInfo.Flavor.IsDocumentDB() {
+			rc.warnedNoOperationTime.Do(func() {
+				rc.logger.Warn().
+					Str("reader", string(rc.readerType)).
+					Msg("Server reports no operationTime; change reader lag will be unavailable. " +
+						"Verification is unaffected.")
+			})
+
+			return
+		}
+
 		panic("session operationTime is nil … did this get called prematurely?")
 	}
 
