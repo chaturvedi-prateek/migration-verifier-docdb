@@ -136,6 +136,14 @@ type Verifier struct {
 	numWorkers         int
 	failureDisplaySize int64
 
+	// srcFlavor forces the source’s server flavor rather than detecting it.
+	// util.FlavorAuto (the default) means detect.
+	srcFlavor util.Flavor
+
+	// readPreferenceMode is the read preference as the user requested it,
+	// retained so that flavor-specific validation can report it back.
+	readPreferenceMode string
+
 	indexSpecTolerances []api.IndexSpecTolerance
 
 	srcChangeReaderMethod string
@@ -235,8 +243,10 @@ func NewVerifier(settings VerifierSettings, logPath string) *Verifier {
 
 		numWorkers:           NumWorkers,
 		readPreference:       readpref.Primary(),
+		readPreferenceMode:   readpref.Primary().Mode().String(),
 		partitionSizeInBytes: 400 * 1024 * 1024,
 		failureDisplaySize:   DefaultFailureDisplaySize,
+		srcFlavor:            util.FlavorAuto,
 
 		readConcernSetting: readConcern,
 		ddlHandling:        ddlHandling,
@@ -428,6 +438,19 @@ func (verifier *Verifier) SetMetaURI(ctx context.Context, uri string) error {
 		Any("clusterInfo", clusterInfo).
 		Msg("Found metadata’s cluster info.")
 
+	// The verifier reads its own recheck queue through a causally-consistent
+	// session, which guarantees it sees every recheck enqueued so far. That
+	// guarantee is load-bearing and DocumentDB can’t provide it, so the
+	// metadata cluster must be MongoDB even when the source isn’t.
+	if clusterInfo.Flavor.IsDocumentDB() {
+		return errors.Errorf(
+			"the metadata cluster may not be DocumentDB: the verifier requires "+
+				"causal consistency to read its own recheck queue reliably, and "+
+				"DocumentDB does not support it; point %#q at a MongoDB cluster",
+			"metaURI",
+		)
+	}
+
 	verifier.metaURI = uri
 	verifier.metaClusterInfo = &clusterInfo
 
@@ -533,6 +556,16 @@ func (verifier *Verifier) SetDocCompareMethod(method compare.Method) error {
 	}
 
 	if method == compare.ToHashedIndexKey {
+		// This mode projects with $_internalKeyStringValue, a MongoDB-internal
+		// aggregation operator that DocumentDB doesn’t implement.
+		if verifier.srcClusterInfo.Flavor.IsDocumentDB() {
+			return docDBUnsupported(
+				fmt.Sprintf("document comparison mode %#q", compare.ToHashedIndexKey),
+				"it requires a MongoDB-internal aggregation operator",
+				fmt.Sprintf("%#q or %#q", compare.Binary, compare.IgnoreOrder),
+			)
+		}
+
 		if minVer, needed := comparehashed.MinNextVersion(verifier.srcClusterInfo.VersionArray).Get(); needed {
 			return errors.Errorf("source version %v is too old for document comparison mode %#q; try version %v", verifier.srcClusterInfo.VersionArray, compare.ToHashedIndexKey, minVer)
 		}
@@ -581,6 +614,14 @@ func validateChangeReaderOpt(
 		if clusterInfo.Topology == util.TopologySharded {
 			return fmt.Errorf("cannot read oplog from sharded cluster")
 		}
+
+		if clusterInfo.Flavor.IsDocumentDB() {
+			return docDBUnsupported(
+				fmt.Sprintf("change reader %#q", ChangeReaderOptOplog),
+				"DocumentDB does not implement the MongoDB operations log",
+				fmt.Sprintf("%#q", ChangeReaderOptChangeStream),
+			)
+		}
 	}
 
 	return nil
@@ -599,8 +640,27 @@ func (verifier *Verifier) SetReadPreference(arg string) error {
 	if err != nil {
 		return err
 	}
+	verifier.readPreferenceMode = arg
 	verifier.readPreference, err = readpref.New(mode)
 	return err
+}
+
+// SetSrcFlavor forces the source cluster’s server flavor rather than letting
+// the verifier detect it. Pass util.FlavorAuto to detect. This must be called
+// before SetSrcURI.
+func (verifier *Verifier) SetSrcFlavor(flavor util.Flavor) error {
+	if flavor != util.FlavorAuto && !slices.Contains(util.Flavors, flavor) {
+		return errors.Errorf(
+			"invalid source flavor (%s); valid values are: %#q, %#q",
+			flavor,
+			util.FlavorAuto,
+			util.Flavors,
+		)
+	}
+
+	verifier.srcFlavor = flavor
+
+	return nil
 }
 
 func (verifier *Verifier) SetPprofInterval(arg string) error {

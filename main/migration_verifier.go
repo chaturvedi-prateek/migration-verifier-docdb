@@ -15,6 +15,7 @@ import (
 	"github.com/10gen/migration-verifier/buildvar"
 	"github.com/10gen/migration-verifier/internal/logger"
 	"github.com/10gen/migration-verifier/internal/partitions"
+	"github.com/10gen/migration-verifier/internal/util"
 	"github.com/10gen/migration-verifier/internal/verifier"
 	"github.com/10gen/migration-verifier/internal/verifier/api"
 	"github.com/10gen/migration-verifier/internal/verifier/compare"
@@ -62,6 +63,17 @@ const (
 	startFlag             = "start"
 	partitioningScheme    = "partitioningScheme"
 	indexSpecIgnoreFlag   = "indexSpecIgnore"
+	srcFlavorFlag         = "srcFlavor"
+)
+
+var srcFlavorStrs = append(
+	mslices.Of(string(util.FlavorAuto)),
+	lo.Map(
+		util.Flavors,
+		func(f util.Flavor, _ int) string {
+			return string(f)
+		},
+	)...,
 )
 
 var logLevelStrs = lo.Map(
@@ -155,6 +167,14 @@ func main() {
 			Name:  metaDBName,
 			Value: "__mdb_internal_migration_verifier",
 			Usage: "`name` of the database in which to store verification metadata",
+		}),
+		altsrc.NewStringFlag(cli.StringFlag{
+			Name:  srcFlavorFlag,
+			Value: string(util.FlavorAuto),
+			Usage: "Source server implementation. One of: " + strings.Join(
+				srcFlavorStrs,
+				", ",
+			) + ". Detection is normally reliable; set this only to override it.",
 		}),
 		altsrc.NewStringFlag(cli.StringFlag{
 			Name:  partitioningScheme,
@@ -366,6 +386,21 @@ func handleArgs(ctx context.Context, cCtx *cli.Context) (*verifier.Verifier, err
 
 	err := v.SetReadPreference(cCtx.String(readPreference))
 	if err != nil {
+		return nil, err
+	}
+
+	srcFlavorVal := cCtx.String(srcFlavorFlag)
+	if !slices.Contains(srcFlavorStrs, srcFlavorVal) {
+		return nil, errors.Errorf(
+			"invalid %#q (%s); valid values are: %#q",
+			srcFlavorFlag,
+			srcFlavorVal,
+			srcFlavorStrs,
+		)
+	}
+
+	// This must precede SetSrcURI, which is where the flavor takes effect.
+	if err := v.SetSrcFlavor(util.Flavor(srcFlavorVal)); err != nil {
 		return nil, err
 	}
 

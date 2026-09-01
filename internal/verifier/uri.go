@@ -22,7 +22,12 @@ func (verifier *Verifier) SetSrcURI(ctx context.Context, uri string) error {
 	verifier.logger.Debug().
 		Msg("Reading source’s cluster info.")
 
-	clusterInfo, err := util.GetClusterInfo(ctx, verifier.logger, verifier.srcClient)
+	clusterInfo, err := util.GetClusterInfoWithFlavor(
+		ctx,
+		verifier.logger,
+		verifier.srcClient,
+		verifier.srcFlavor,
+	)
 	if err != nil {
 		return errors.Wrap(err, "failed to read source cluster info")
 	}
@@ -32,6 +37,18 @@ func (verifier *Verifier) SetSrcURI(ctx context.Context, uri string) error {
 		Msg("Found source’s cluster info.")
 
 	verifier.srcClusterInfo = &clusterInfo
+
+	if clusterInfo.Flavor.IsDocumentDB() {
+		verifier.logger.Info().
+			Msg("Source is Amazon DocumentDB. MongoDB-only features will be disabled.")
+
+		// DocumentDB has no gossiped cluster time, so the verifier can’t pin
+		// reads with afterClusterTime and instead depends on primary reads
+		// being read-after-write consistent.
+		if err := checkDocumentDBReadPreference(verifier.readPreferenceMode); err != nil {
+			return err
+		}
+	}
 
 	if clusterInfo.VersionArray[0] < 5 && clusterInfo.Topology == util.TopologySharded {
 		err := RefreshSrcMongosInstances(

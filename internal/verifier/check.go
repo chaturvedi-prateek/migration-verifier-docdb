@@ -211,6 +211,15 @@ func (verifier *Verifier) CheckDriver(ctx context.Context, filter bson.D, testCh
 		}
 	}
 
+	// A DocumentDB source needs its change streams explicitly enabled. Check
+	// that before starting the readers, since an unwatched namespace would
+	// otherwise produce a silently incomplete verification rather than an
+	// error.
+	if err := verifier.runDocumentDBSourcePreflight(ctx); err != nil {
+		verifier.mux.Unlock()
+		return err
+	}
+
 	// Now that we’ve initialized verifier.generation we can
 	// start the change readers.
 	err = verifier.initializeChangeReaders()
