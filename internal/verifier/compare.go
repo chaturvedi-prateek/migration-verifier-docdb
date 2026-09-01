@@ -392,6 +392,7 @@ func (verifier *Verifier) getFetcherChannelsAndCallbacksForNaturalPartition(
 				state,
 				theCursor,
 				dstToCompareChannel,
+				verifier.dstClusterInfo.Flavor,
 			)
 			if err != nil {
 				return errors.Wrap(
@@ -525,6 +526,7 @@ func (verifier *Verifier) getFetcherChannelsAndCallbacksForIDPartition(
 				state,
 				theCursor,
 				srcChannel,
+				verifier.srcClusterInfo.Flavor,
 			)
 
 			err = errors.Wrap(
@@ -568,6 +570,7 @@ func (verifier *Verifier) getFetcherChannelsAndCallbacksForIDPartition(
 				state,
 				theCursor,
 				dstChannel,
+				verifier.dstClusterInfo.Flavor,
 			)
 			err = errors.Wrap(
 				err,
@@ -596,6 +599,7 @@ func iterateCursorToChannel(
 	state retry.SuccessNotifier,
 	cursor *mongo.Cursor,
 	writer chan<- compare.ToComparatorMsg,
+	flavor util.Flavor,
 ) (int, error) {
 	sess := mongo.SessionFromContext(sctx)
 	if sess == nil {
@@ -641,7 +645,7 @@ func iterateCursorToChannel(
 
 		docsCount++
 
-		clusterTime, err := util.GetClusterTimeFromSession(sess)
+		clusterTime, err := util.GetSessionTimestamp(sess, flavor)
 		if err != nil {
 			return 0, errors.Wrap(err, "reading cluster time from session")
 		}
@@ -763,13 +767,26 @@ func (verifier *Verifier) getDocumentsCursor(
 
 	// We never want to read before the change stream start time,
 	// or for the last generation, the change stream end time.
-	cmd = append(
-		cmd,
-		bson.E{"readConcern", bson.D{
-			{"level", "majority"},
-			{"afterClusterTime", readConcernTS},
-		}},
-	)
+	//
+	// DocumentDB has no gossiped cluster time, so afterClusterTime is
+	// meaningless there and the server rejects causally-consistent reads
+	// outright. Instead we rely on its guarantee that primary reads are
+	// read-after-write consistent, combined with the fact that the change
+	// reader is opened before any scan read is issued (see
+	// initializeChangeReaders). A write therefore either committed before our
+	// read, in which case the primary shows it to us, or after it, in which
+	// case its timestamp follows the reader's start point and the change
+	// stream captures it. checkDocumentDBReadPreference enforces the primary
+	// read preference that this argument depends on.
+	if !clusterInfo.Flavor.IsDocumentDB() {
+		cmd = append(
+			cmd,
+			bson.E{"readConcern", bson.D{
+				{"level", "majority"},
+				{"afterClusterTime", readConcernTS},
+			}},
+		)
+	}
 
 	// Suppress this log for recheck tasks because the list of IDs can be
 	// quite long.

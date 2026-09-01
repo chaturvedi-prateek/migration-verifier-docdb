@@ -132,6 +132,11 @@ an existing escape hatch (`--ignoreReadConcern`), but if majority is
 unsupported we should skip it automatically for DocumentDB rather than making
 users discover the flag.
 
+**Narrowed by step 4.** Source `find` commands no longer send a `readConcern`
+at all when the source is DocumentDB, so this now only concerns the
+client-level majority read concern that `buildClientOpts` sets. If DocumentDB
+rejects that, we must skip it for DocumentDB connections too.
+
 **How to check.** `db.coll.find().readConcern("majority")` and a raw `find`
 with an explicit `readConcern` document.
 
@@ -147,6 +152,12 @@ clock while the stream is idle. Needed for steps 4 and 5.
 **Source.** An AWS error-response example includes
 `"operationTime" : Timestamp(1603461817, 493214)`, which is suggestive but is
 an error path, not a documented guarantee.
+
+**Now load-bearing.** Step 4 wired this in: `util.GetSessionTimestamp` reads
+`sess.OperationTime()` for DocumentDB instead of `sess.ClusterTime()`, and the
+change stream takes its start timestamp from it. The driver populates
+`OperationTime` from the reply's `operationTime` field, so if DocumentDB omits
+it, opening a change stream fails with "session has no operationTime".
 
 **How to check.** Run `hello`, `ping`, and `dbStats` via `runCommand` and
 inspect the raw replies for `operationTime`. Confirm it advances after writes.

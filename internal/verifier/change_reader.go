@@ -381,18 +381,58 @@ func (rc *ChangeReaderCommon) start(
 	return nil
 }
 
+// positionTimestamp returns the timestamp of the reader’s current position in
+// the change stream.
+//
+// On MongoDB the resume token encodes a cluster time, so we decode it. A
+// DocumentDB token is opaque — its _data uses an undocumented encoding that is
+// not a MongoDB KeyString — so there we use the last change event’s
+// clusterTime, falling back to the last timestamp the server reported when no
+// event has arrived yet.
+//
+// The fallback matters because an idle stream produces no events, and without
+// it the reader’s notion of time would stall.
+func (rc *ChangeReaderCommon) positionTimestamp(token bson.Raw) (bson.Timestamp, error) {
+	if !rc.clusterInfo.Flavor.IsDocumentDB() {
+		return rc.resumeTokenTSExtractor(token)
+	}
+
+	if ts, has := rc.lastChangeEventTime.Load().Get(); has {
+		return ts, nil
+	}
+
+	if ts, has := rc.lastSeenClusterTime.Load().Get(); has {
+		return ts, nil
+	}
+
+	return bson.Timestamp{}, errors.Errorf(
+		"%s has no position timestamp yet: no change event has arrived and no server timestamp has been recorded",
+		rc.readerType,
+	)
+}
+
 func (rc *ChangeReaderCommon) persistResumeToken(ctx context.Context, token bson.Raw) error {
 	if len(token) == 0 {
 		panic("internal error: resume token is empty but should never be")
 	}
 
-	ts, err := rc.resumeTokenTSExtractor(token)
-	if err != nil {
-		return errors.Wrapf(err, "parsing resume token %#q", token)
-	}
+	// This timestamp is only used to annotate the log line below. On
+	// DocumentDB it may legitimately be unavailable before the first event
+	// arrives, so treat it as best-effort rather than fatal there.
+	tsOpt := option.None[bson.Timestamp]()
 
-	if ts.IsZero() {
-		panic("empty ts in resume token is invalid!")
+	ts, err := rc.positionTimestamp(token)
+	switch {
+	case err != nil:
+		if !rc.clusterInfo.Flavor.IsDocumentDB() {
+			return errors.Wrapf(err, "parsing resume token %#q", token)
+		}
+	case ts.IsZero():
+		if !rc.clusterInfo.Flavor.IsDocumentDB() {
+			panic("empty ts in resume token is invalid!")
+		}
+	default:
+		tsOpt = option.Some(ts)
 	}
 
 	eventCounts := rc.GetCumulativeEventCounts()
@@ -419,7 +459,9 @@ func (rc *ChangeReaderCommon) persistResumeToken(ctx context.Context, token bson
 		Str("changeReader", string(rc.readerType)).
 		Object("changeEventCounts", eventCounts)
 
-	logEvent = addTimestampToLogEvent(ts, logEvent)
+	if ts, has := tsOpt.Get(); has {
+		logEvent = addTimestampToLogEvent(ts, logEvent)
+	}
 
 	logEvent.Msg("Persisted resume token.")
 
@@ -469,7 +511,7 @@ func (rc *ChangeReaderCommon) loadResumeToken(ctx context.Context) (option.Optio
 }
 
 func (rc *ChangeReaderCommon) updateLastSeenClusterTime(sess *mongo.Session) {
-	clusterTime, err := util.GetClusterTimeFromSession(sess)
+	clusterTime, err := util.GetSessionTimestamp(sess, rc.clusterInfo.Flavor)
 
 	if err != nil {
 		rc.logger.Warn().
@@ -487,7 +529,7 @@ func (rc *ChangeReaderCommon) updateTimestamps(sess *mongo.Session, token bson.R
 		panic("session operationTime is nil … did this get called prematurely?")
 	}
 
-	tokenTS, err := rc.resumeTokenTSExtractor(token)
+	tokenTS, err := rc.positionTimestamp(token)
 	if err == nil {
 		rc.currentTimestamps.Store(option.Some(readerCurrentTimestamps{
 			LastHandled:   tokenTS,

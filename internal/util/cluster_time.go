@@ -21,3 +21,26 @@ func GetClusterTimeFromSession(sess *mongo.Session) (bson.Timestamp, error) {
 
 	return mbson.CastRawValue[bson.Timestamp](ctrv)
 }
+
+// GetSessionTimestamp returns a timestamp describing how current the session’s
+// view of the server is.
+//
+// For MongoDB this is the gossiped $clusterTime. DocumentDB gossips no cluster
+// time at all — it does not implement causal consistency — so there we use
+// operationTime, which the server does return in command responses. The two
+// are not interchangeable in general, but both serve the purpose we need here:
+// a monotonic marker of how far the server has advanced.
+func GetSessionTimestamp(sess *mongo.Session, flavor Flavor) (bson.Timestamp, error) {
+	if !flavor.IsDocumentDB() {
+		return GetClusterTimeFromSession(sess)
+	}
+
+	opTime := sess.OperationTime()
+	if opTime == nil {
+		return bson.Timestamp{}, errors.New(
+			"session has no operationTime; DocumentDB is expected to return one in command responses",
+		)
+	}
+
+	return *opTime, nil
+}

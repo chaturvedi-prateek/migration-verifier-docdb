@@ -146,7 +146,13 @@ func (csr *ChangeStreamReader) GetChangeStreamFilter() (pipeline mongo.Pipeline)
 		},
 	)
 
-	if util.ClusterHasBSONSize([2]int(csr.clusterInfo.VersionArray)) {
+	// DocumentDB reports a MongoDB version that clears this check, but it
+	// permits only $match, $project, $redact, $addFields, and $replaceRoot in a
+	// change stream pipeline, and $bsonSize is not available there. Without
+	// this stage the reader falls back to sizing events from fullDocument,
+	// which is what pre-4.4 MongoDB does too.
+	if !csr.clusterInfo.Flavor.IsDocumentDB() &&
+		util.ClusterHasBSONSize([2]int(csr.clusterInfo.VersionArray)) {
 		pipeline = append(
 			pipeline,
 			bson.D{
@@ -312,6 +318,28 @@ changeStreamLoop:
 				Any("writesOffTimestamp", writesOffTs).
 				Msgf("%s received writesOff timestamp. Finalizing change stream.", csr)
 
+			// The drain below compares the reader’s consumed-up-to position
+			// against writesOffTs. On MongoDB the resume token supplies that
+			// position exactly. DocumentDB has no equivalent: its token is
+			// opaque, the last event’s clusterTime stalls once events stop
+			// (looping forever), and the server’s operationTime means “the
+			// server has advanced to T”, not “this reader has consumed up to
+			// T” — using it could end the drain while events are still
+			// undelivered, which would silently drop rechecks.
+			//
+			// Rather than approximate it, we stop. Draining DocumentDB
+			// correctly needs its own termination rule (drain until getMore
+			// returns empty for N consecutive polls past writesOffTs).
+			if csr.clusterInfo.Flavor.IsDocumentDB() {
+				return errors.Errorf(
+					"cannot finalize a DocumentDB change stream: %s has no resume-token timestamp "+
+						"to compare against the writes-off timestamp (%v), and no safe substitute "+
+						"is implemented yet",
+					csr,
+					writesOffTs,
+				)
+			}
+
 			// Read change events until the stream reaches the writesOffTs.
 			// (i.e., the `getMore` call returns empty)
 			for {
@@ -371,7 +399,9 @@ func (csr *ChangeStreamReader) createChangeStream(
 	opts := options.ChangeStream().
 		SetMaxAwaitTime(maxChangeStreamAwaitTime)
 
-	if csr.clusterInfo.VersionArray[0] >= 6 {
+	// These are MongoDB-internal change stream parameters. DocumentDB would
+	// report a high enough version to pass the check but does not accept them.
+	if !csr.clusterInfo.Flavor.IsDocumentDB() && csr.clusterInfo.VersionArray[0] >= 6 {
 		opts = opts.SetCustomPipeline(
 			bson.M{
 				"showSystemEvents":   true,
@@ -393,7 +423,7 @@ func (csr *ChangeStreamReader) createChangeStream(
 		logEvent := csStartLogEvent.
 			Stringer(resumeTokenDocID(csr.readerType), resumetoken)
 
-		ts, err := csr.resumeTokenTSExtractor(resumetoken)
+		ts, err := csr.positionTimestamp(resumetoken)
 		if err == nil {
 			logEvent = addTimestampToLogEvent(ts, logEvent)
 		} else {
@@ -404,7 +434,10 @@ func (csr *ChangeStreamReader) createChangeStream(
 
 		logEvent.Msg("Starting change stream from persisted resume token.")
 
-		if util.ClusterHasChangeStreamStartAfter([2]int(csr.clusterInfo.VersionArray)) {
+		// DocumentDB supports only resumeAfter and startAtOperationTime, never
+		// startAfter, though it reports a version that clears the check.
+		if !csr.clusterInfo.Flavor.IsDocumentDB() &&
+			util.ClusterHasChangeStreamStartAfter([2]int(csr.clusterInfo.VersionArray)) {
 			opts = opts.SetStartAfter(resumetoken)
 		} else {
 			opts = opts.SetResumeAfter(resumetoken)
@@ -442,34 +475,51 @@ func (csr *ChangeStreamReader) createChangeStream(
 		}
 	}
 
-	startTs, err := csr.resumeTokenTSExtractor(changeStream.ResumeToken())
-	if err != nil {
-		changeStream.Close(sctx)
-		return bson.Timestamp{}, errors.Wrap(err, "failed to extract timestamp from change stream's resume token")
-	}
-
-	// With sharded clusters the resume token might lead the cluster time
-	// by 1 increment. In that case we need the actual cluster time;
-	// otherwise we will get errors.
-	clusterTime, err := util.GetClusterTimeFromSession(sess)
+	// The server timestamp as of the stream’s creation. On MongoDB this is the
+	// gossiped cluster time; on DocumentDB it is the session’s operationTime.
+	clusterTime, err := util.GetSessionTimestamp(sess, csr.clusterInfo.Flavor)
 	if err != nil {
 		changeStream.Close(sctx)
 		return bson.Timestamp{}, errors.Wrap(err, "failed to read cluster time from session")
 	}
 
-	if startTs.After(clusterTime) {
-		csr.logger.Debug().
-			Any("resumeTokenTimestamp", startTs).
-			Any("clusterTime", clusterTime).
-			Stringer("changeStreamReader", csr).
-			Msg("Cluster time predates resume token; using it as start timestamp.")
+	var startTs bson.Timestamp
 
+	if csr.clusterInfo.Flavor.IsDocumentDB() {
+		// DocumentDB’s resume token carries no timestamp we can read, so the
+		// server’s own clock is the only available start position. Taking it
+		// from the same session that opened the stream keeps the two ordered:
+		// operationTime reflects the server state as of stream creation.
 		startTs = clusterTime
-	} else {
+
 		csr.logger.Debug().
-			Any("resumeTokenTimestamp", startTs).
+			Any("operationTime", startTs).
 			Stringer("changeStreamReader", csr).
-			Msg("Got start timestamp from change stream.")
+			Msg("Got start timestamp from server operation time.")
+	} else {
+		startTs, err = csr.resumeTokenTSExtractor(changeStream.ResumeToken())
+		if err != nil {
+			changeStream.Close(sctx)
+			return bson.Timestamp{}, errors.Wrap(err, "failed to extract timestamp from change stream's resume token")
+		}
+
+		// With sharded clusters the resume token might lead the cluster time
+		// by 1 increment. In that case we need the actual cluster time;
+		// otherwise we will get errors.
+		if startTs.After(clusterTime) {
+			csr.logger.Debug().
+				Any("resumeTokenTimestamp", startTs).
+				Any("clusterTime", clusterTime).
+				Stringer("changeStreamReader", csr).
+				Msg("Cluster time predates resume token; using it as start timestamp.")
+
+			startTs = clusterTime
+		} else {
+			csr.logger.Debug().
+				Any("resumeTokenTimestamp", startTs).
+				Stringer("changeStreamReader", csr).
+				Msg("Got start timestamp from change stream.")
+		}
 	}
 
 	csr.changeStream = changeStream

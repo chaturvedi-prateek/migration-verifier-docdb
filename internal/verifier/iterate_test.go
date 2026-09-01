@@ -4,6 +4,7 @@ import (
 	"strings"
 
 	"github.com/10gen/migration-verifier/internal/testutil"
+	"github.com/10gen/migration-verifier/internal/util"
 	"github.com/10gen/migration-verifier/internal/verifier/compare"
 	"github.com/samber/lo"
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -51,6 +52,7 @@ func (s *IntegrationTestSuite) TestIterateCursorToChannel() {
 		&testutil.MockSuccessNotifier{T: s.T()},
 		theCursor,
 		receiver,
+		util.FlavorMongoDB,
 	)
 	s.Require().NoError(err)
 
