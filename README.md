@@ -354,6 +354,7 @@ unaffected. When set, a corresponding entry is added to `notes`.
 | `--docCompareMethod`                    | How to compare documents. See below for details.                                                                                                                                        |
 | `--partitioningScheme`                  | How to partition collections. See below for details.                                                                                                                                        |
 | `--srcChangeReader`                     | How to read changes from the source. See below for details.             |
+| `--srcFlavor`                           | Source server implementation: `auto` (default), `mongodb`, or `documentdb`. Detection is normally reliable; set this only to override it. See below.             |
 | `--dstChangeReader`                     | How to read changes from the destination. See below for details.        |
 | `--start`                               | Start checking documents right away rather than waiting for a `/check` API request. |
 | `--verifyAll`                           | If set, verify all user namespaces                                                                                                                                                          |
@@ -711,6 +712,165 @@ The default. The verifier will read a change stream, which works seamlessly on s
 
 The verifier will read the oplog continually instead of reading a change stream. This is generally faster, but it only works when connecting to a replica set (i.e., not a mongos).
 
+# Amazon DocumentDB sources
+
+The verifier can verify a migration **from** Amazon DocumentDB **to** MongoDB.
+DocumentDB emulates MongoDB's wire protocol and reports a MongoDB version
+number (5.0.0), but does not implement many of the features that version
+implies, so the verifier detects it and adapts. Detection is automatic;
+`--srcFlavor documentdb` forces it if that ever misfires.
+
+DocumentDB as a *destination* or as the *metadata* cluster is not supported.
+
+## Connecting
+
+DocumentDB requires TLS, and a tunnelled connection needs some care:
+
+```
+--srcURI "mongodb://user:pass@host:27017/?tls=true\
+&tlsCAFile=/path/to/global-bundle.pem\
+&directConnection=true\
+&retryWrites=false"
+```
+
+- **`directConnection=true`** — without it the driver performs replica-set
+  discovery, learns the cluster's internal instance endpoints, and tries to
+  connect to those directly. The verifier adds this automatically for a
+  single-host URI with no `replicaSet`.
+- **`retryWrites=false`** — DocumentDB does not support retryable writes.
+- **`tlsAllowInvalidHostnames` does not work.** That is a `mongosh` option; the
+  Go driver accepts only `tlsInsecure`. If you are tunnelling and the
+  certificate name will not match, either add a hosts entry so the real
+  hostname resolves locally (preferred — certificates carry no port, so a
+  forwarded port is fine) or use `tlsInsecure=true`.
+- The read preference must resolve to the primary; see below.
+
+## Required setup: enable change streams
+
+DocumentDB disables change streams by default, and a change stream opened
+against a namespace that has them disabled simply yields no events. The
+verifier would then miss every concurrent write and report a match it cannot
+justify, so it **refuses to start** unless the namespaces it will verify have
+change streams enabled.
+
+```js
+// per database
+db.adminCommand({modifyChangeStreams: 1, database: "mydb", collection: "", enable: true})
+
+// cluster-wide, which --verifyAll requires
+db.adminCommand({modifyChangeStreams: 1, database: "", collection: "", enable: true})
+```
+
+`--verifyAll` requires the cluster-wide form, because a database created
+mid-run would otherwise go unwatched.
+
+## Options the verifier rejects for a DocumentDB source
+
+Each of these fails at startup with an explanation:
+
+| Option | Why |
+|---|---|
+| `--srcChangeReader tailOplog` | DocumentDB has no operations log. |
+| `--docCompareMethod toHashedIndexKey` | Needs a MongoDB-internal aggregation operator. Use `binary` or `ignoreFieldOrder`. |
+| `--readPreference secondary`/`secondaryPreferred`/`nearest` | See the consistency note below. |
+| `--partitioningScheme natural` | DocumentDB has no `$natural` ordering. Use `_id`. |
+| A DocumentDB `--metaURI` | The verifier reads its own recheck queue through a causally-consistent session, which DocumentDB cannot provide. |
+
+## How correctness is maintained without causal consistency
+
+Against MongoDB, every document read is pinned with
+`readConcern: {afterClusterTime: …}` so it cannot observe a state older than
+the change reader's start point. DocumentDB implements no causal consistency
+and rejects such reads outright, so the verifier relies instead on two facts:
+
+1. The change reader is opened before any scan read is issued.
+2. Reads from a DocumentDB **primary** are read-after-write consistent.
+
+A write therefore either committed before a scan read — in which case the
+primary shows it to us — or after it, in which case its timestamp follows the
+reader's start point and the change stream captures it. This is why a
+secondary read preference is rejected: replica reads are only eventually
+consistent, which would break the argument.
+
+## Watch out for
+
+### Change stream retention
+
+DocumentDB retains change stream events for **3 hours by default** (7 days
+maximum). If the verifier is interrupted for longer than the window, its resume
+token expires. Resuming past that point would leave an unobserved gap, so the
+verifier **aborts and requires a restart with `--clean`** rather than
+continuing.
+
+Raise `change_stream_log_retention_duration` on the cluster parameter group for
+any long verification. The setting cannot be read over the MongoDB connection
+(`getParameter` is unimplemented), so the verifier warns unconditionally rather
+than checking.
+
+### The change reader is much slower than DocumentDB accepts writes
+
+In testing, DocumentDB accepted ~23,000 inserts/sec while the verifier's change
+reader consumed ~800–1,400 events/sec. **No events were lost**: a 60-second
+burst of 1,380,500 inserts was eventually consumed in full and every one of the
+1,380,500 documents was reported. But working through it took ~20 minutes.
+
+Under sustained writes above roughly 1–2k/sec the recheck queue will not
+converge, and a reader that falls far enough behind can outrun the retention
+window above. That measurement was taken over an SSH tunnel, which penalises
+the reader's round-trip-bound `getMore` loop far more than it does batched
+writes, so expect better in-VPC — but measure before relying on it.
+
+### Let bulk writes finish before turning writes off
+
+DocumentDB's multi-document writes are atomic, so a large `updateMany` that is
+still running when you turn writes off commits *entirely* after the writes-off
+timestamp and is excluded from verification wholesale. On MongoDB the same
+write produces per-document oplog entries, so the portion before the cutoff
+would still be caught.
+
+Wait for bulk operations to complete before turning writes off. (Writing after
+writes-off is out of contract either way; DocumentDB just makes the
+consequence sharper.)
+
+### Index changes during a run are invisible
+
+DocumentDB emits only `insert`, `update`, `delete`, and `drop` change events.
+Creating a collection, and **all index DDL**, produce no events at all. So an
+index created or dropped mid-run is never noticed — indexes are compared once,
+during generation 0. Dropping a *collection* does emit `drop`, which aborts the
+run.
+
+### Metadata is normalised, not compared verbatim
+
+DocumentDB and MongoDB describe the same collection differently. The verifier
+strips the differences that describe the engine rather than the data, so that
+mismatches reflect real divergence:
+
+- Collection options: `storageEngine` and `autoIndexId` are dropped, and
+  `capped: false` is treated as equivalent to the field being absent.
+- Index specifications: `ns` and `2dsphereIndexVersion` are dropped, and `v` is
+  normalised (DocumentDB reports `v: 4`, MongoDB `v: 2`).
+
+Everything that defines an index — key, `unique`, `sparse`,
+`partialFilterExpression`, `expireAfterSeconds` — is compared normally.
+
+### Not applicable on DocumentDB
+
+Capped collections and views cannot be created on DocumentDB, so the verifier's
+handling of both is unreachable from a DocumentDB source.
+
+## Verification status
+
+The DocumentDB support was validated against a live DocumentDB 5.0.0 cluster:
+250,000 documents across 5 collections, every BSON type and index type
+DocumentDB supports, deliberate mismatch injection, a forced primary failover
+(no events lost), resume-token expiry, and a 1.38-million-event write burst.
+
+`architecture/documentdb_open_questions.md` records every assumption the
+support rests on, how it was confirmed, and what remains unverified.
+`architecture/documentdb_probe.js` re-checks most of them against a cluster in
+one run.
+
 # Known Issues
 
 - If memory usage rises after generation 0, try reducing `recheckMaxSizeMB`. This will shrink the queries that the verifier sends, which in turn should reduce the server’s memory usage. (The number of actual queries sent will rise, of course.)
@@ -726,5 +886,7 @@ NB: Given bucket documents’ size, hashed document comparison can be especially
 # Limitations
 
 - The verifier does not verify DDL changes. By default, such changes will crash the verifier. (See the `--ddlHandling` option above for alternative behavior.)
+
+- Amazon DocumentDB sources carry additional limitations; see [Amazon DocumentDB sources](#amazon-documentdb-sources).
 
 - The verifier cannot verify time-series collections under namespace filtering.

@@ -74,6 +74,117 @@ Still open: **Q4** (resume expiry — needs a timed retention test), **Q8**
 (failover), **Q14** (full change stream pipeline), **Q16** (DDL event types),
 **Q22** (drain termination). **Q23** and **Q24** need code.
 
+## Operational behaviours verified, 2026-09-01
+
+Beyond the numbered questions, these paths were exercised against the live
+cluster:
+
+**Safety gates all fire.** `--srcChangeReader tailOplog`,
+`--docCompareMethod toHashedIndexKey`, `--readPreference secondary`, and a
+DocumentDB `--metaURI` are each rejected at startup with an explanatory error.
+`--partitioningScheme natural` is rejected too, but only once a collection is
+large enough to need partitioning — small collections short-circuit before the
+scheme is consulted, and take a single-partition path that does not use
+`$natural`, so they are correct either way.
+
+**Resume-expiry gate works end to end.** Ageing the persisted token's
+timestamp and restarting without `--clean` makes the verifier abort rather
+than resume across the gap, with the `--clean` remediation in the message.
+This is the behaviour that Q4 showed was previously failing open.
+
+**All four CRUD change types flow through the recheck path.** A run against
+matching collections, with an update, a replace, a delete, and an insert
+applied to the source only, saw exactly one event of each type and reported
+all four correctly: the update and replace as field mismatches, the delete as
+present-only-on-destination, the insert as present-only-on-source.
+DocumentDB does emit `replace`; the earlier DDL probe missed it only because
+that probe used `$set`.
+
+**`--verifyAll` correctly refuses** when change streams are enabled per
+database rather than cluster-wide, naming what is enabled and how to fix it.
+
+**A source collection drop aborts the run** with `unknown optype`, as designed.
+Per Q16 this is the only DDL DocumentDB can emit, so it is the only DDL that
+can ever stop a verification.
+
+### Also exercised
+
+**Document comparison modes.** With 500 documents holding identical content in
+different BSON field order, `--docCompareMethod binary` reports mismatches and
+`--docCompareMethod ignoreOrder` reports clean — each doing exactly what its
+name says.
+
+**Namespace remapping.** `mvtest.origname` on the source verified against
+`remapdb.newname` on the destination: clean, 300 documents.
+
+**`--verifyAll`.** With change streams enabled cluster-wide it passes Gate A
+and verifies every namespace: 4 namespaces, 52,338 documents. Note that a
+collection existing on only one side is **fatal in either direction** under
+verifyAll, not a reported mismatch.
+
+**Scale.** 5 collections totalling 250,000 documents verified in 28.3 s at
+8,824 docs/sec with 10 workers, clean, no errors. Throughput over an SSH
+tunnel to ap-south-1; in-VPC would be faster.
+
+**Bulk writes and the drain.** A 50,000-document `updateMany` takes ~11 s on
+this cluster. Two cases, and the difference matters:
+
+- *Contract honoured* — the `updateMany` completes, then writes-off is called:
+  all 50,000 changes are caught through the recheck path (55,959 mismatch
+  records across three generations).
+- *Contract violated* — writes-off called while the `updateMany` is still
+  running: those changes are **not** caught, and the run reports clean.
+
+The second case is operator error by definition — writes-off means writes have
+stopped. But it is worth stating because DocumentDB makes it sharper than
+MongoDB does: DocumentDB's multi-document writes are atomic, so a bulk
+operation straddling the fence commits entirely after it and is excluded
+wholesale. On MongoDB the same bulk write produces per-document oplog entries,
+so the portion before the fence would be caught. **Wait for bulk operations to
+finish before calling writes-off.**
+
+### High write throughput
+
+Six parallel writers issuing batched `insertMany` drove **1,380,500 inserts in
+60 seconds (~23,000/sec)** into a watched collection while a verification ran.
+
+**No events were lost.** The change reader eventually consumed exactly
+1,380,500 of 1,380,500 events, drained, and the final generation reported
+exactly 1,380,500 documents as destination-missing — matching ground truth
+document for document.
+
+**But it consumed them at only ~800-1,400 events/sec** — roughly a 17-20x
+shortfall against the write rate. A 60-second burst took ~20 minutes to work
+through.
+
+Two consequences for capacity planning:
+
+1. Under sustained writes above roughly 1-2k/sec the recheck queue grows
+   without bound and the verification never converges.
+2. DocumentDB retains change stream events for 3 hours by default. A reader
+   falling behind at this ratio can outrun the retention window and hit the
+   Q4 expiry abort, forcing a restart from a full scan. Raising
+   `change_stream_log_retention_duration` is the mitigation.
+
+**Treat the rate as a floor, not a verdict.** This was measured over an SSH
+tunnel to ap-south-1. The writers hit 23k/sec through the *same* tunnel using
+one round trip per 500 documents, whereas the reader's `getMore` loop is far
+more round-trip-bound and so is penalised disproportionately by latency.
+Re-measure from inside the VPC before sizing anything on it.
+
+### Not yet exercised
+
+- The same throughput measurement from inside the VPC, which is the number
+  that would actually matter operationally.
+- Collections individually larger than ~50 MiB.
+
+### Unrelated upstream bug found
+
+`--checkOnly` panics with a nil pointer dereference: it calls `WritesOff`
+before `initializeChangeReaders`, so `srcChangeReader` is nil. Reproduced
+MongoDB-to-MongoDB, so it is not DocumentDB-specific and is not fixed here.
+Drive runs through `--start` plus the `/api/v1/writesOff` endpoint instead.
+
 ## Prerequisites for checking these
 
 Most checks need a DocumentDB cluster with change streams enabled and a
