@@ -129,22 +129,45 @@ func (csr *ChangeStreamReader) GetChangeStreamFilter() (pipeline mongo.Pipeline)
 		}
 	}
 
-	pipeline = append(
-		pipeline,
-		bson.D{
-			{"$addFields", bson.D{
-				{"_docID", agg.Cond{
-					If:   helpers.Exists{"$documentKey"},
-					Then: "$documentKey._id",
-					Else: "$$REMOVE",
+	if csr.clusterInfo.Flavor.IsDocumentDB() {
+		// DocumentDB rejects $$REMOVE outright ("Feature not supported"), so
+		// it cannot prune fields the way the MongoDB pipeline below does.
+		//
+		// That pruning is a bandwidth optimisation, not a correctness
+		// requirement: ParsedEvent reads only operationType, ns, _docID,
+		// fullDocument, _fullDocLen, and clusterTime, and ignores everything
+		// else. So we keep just the stage that actually matters — lifting
+		// documentKey._id into _docID — and let the unused fields ride along.
+		//
+		// The $cond guard is unnecessary here too: when an event has no
+		// documentKey (a DDL event), "$documentKey._id" evaluates to missing
+		// and $addFields omits the field, which is what $$REMOVE achieved.
+		pipeline = append(
+			pipeline,
+			bson.D{
+				{"$addFields", bson.D{
+					{"_docID", "$documentKey._id"},
 				}},
+			},
+		)
+	} else {
+		pipeline = append(
+			pipeline,
+			bson.D{
+				{"$addFields", bson.D{
+					{"_docID", agg.Cond{
+						If:   helpers.Exists{"$documentKey"},
+						Then: "$documentKey._id",
+						Else: "$$REMOVE",
+					}},
 
-				{"updateDescription", "$$REMOVE"},
-				{"wallTime", "$$REMOVE"},
-				{"documentKey", "$$REMOVE"},
-			}},
-		},
-	)
+					{"updateDescription", "$$REMOVE"},
+					{"wallTime", "$$REMOVE"},
+					{"documentKey", "$$REMOVE"},
+				}},
+			},
+		)
+	}
 
 	// DocumentDB reports a MongoDB version that clears this check, but it
 	// permits only $match, $project, $redact, $addFields, and $replaceRoot in a

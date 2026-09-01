@@ -32,6 +32,32 @@ func TestIsChangeStreamHistoryLostError(t *testing.T) {
 		assert.True(t, IsChangeStreamHistoryLostError(err))
 	})
 
+	// Captured from DocumentDB 5.0.0 on 2026-09-01 by resuming from a token
+	// whose timestamp predated the change stream retention window. DocumentDB
+	// reports the mechanism -- its log is a capped collection -- rather than
+	// the meaning, and shares neither code nor wording with MongoDB. Without
+	// this case the gate fails open: the verifier would resume across an
+	// unobserved gap and report a match it cannot justify.
+	t.Run("matches DocumentDB's expired-token error", func(t *testing.T) {
+		err := mongo.CommandError{
+			Code:    136,
+			Message: "CappedPositionLost: CollectionScan died due to position in capped collection being deleted.",
+		}
+
+		assert.True(t, IsChangeStreamHistoryLostError(err))
+	})
+
+	t.Run("does not match DocumentDB's malformed-token error", func(t *testing.T) {
+		// A corrupt token is a different failure and must not be reported as
+		// lost history.
+		err := mongo.CommandError{
+			Code:    9,
+			Message: "Invalid resume token: {_data: '01deadbeef...'}",
+		}
+
+		assert.False(t, IsChangeStreamHistoryLostError(err))
+	})
+
 	t.Run("matches by message when the code is unknown", func(t *testing.T) {
 		// DocumentDB's code for this is undocumented, so message matching is
 		// the fallback.

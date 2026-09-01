@@ -47,6 +47,29 @@ Real code exercised successfully against this cluster:
 **Second run, change streams enabled** (scoped to the probe database, then
 disabled again): **14 pass, 0 fail.** Q2, Q3, Q15 all confirmed.
 
+## End-to-end verification, 2026-09-01
+
+50,000 documents covering every BSON type DocumentDB supports, plus a
+12-document collection whose `_id`s span 12 different BSON types, plus all 10
+supported index types (single, compound, multikey, nested, unique, sparse,
+partial, TTL, 2dsphere, descending). DocumentDB accepted every type and index.
+Source DocumentDB 5.0.0 -> destination MongoDB 7.0.40 replica set.
+
+**Result: 50,021 documents compared at 8,097/sec, no mismatches.**
+
+Four bugs blocked this, each found only by running it, all now fixed: Q14
+(`$$REMOVE`), Q24 (capped skipping all verification), Q23 (`v: 4` aborting the
+run), and the `$expr` false alarm described under Q28.
+
+**Mismatch detection verified**: six deliberate differences were injected into
+the destination (changed field, deleted document, extra document, dropped
+index, altered index option, changed field in the mixed-`_id` collection). All
+six were detected and correctly categorised, including source-only vs
+destination-only documents.
+
+**MongoDB -> MongoDB regression**: a clean pass on the same build, confirming
+the flavor gates did not disturb the original path.
+
 Still open: **Q4** (resume expiry — needs a timed retention test), **Q8**
 (failover), **Q14** (full change stream pipeline), **Q16** (DDL event types),
 **Q22** (drain termination). **Q23** and **Q24** need code.
@@ -376,7 +399,16 @@ is a deliberate divergence from the MongoDB path.
 **How to check.** `db.createCollection("c", {capped: true, size: 100000})` and
 see whether DocumentDB accepts it.
 
-### Q14. Change stream pipeline stages are accepted — **OPEN**
+### Q14. Change stream pipeline stages are accepted — **CLUSTER** (5.0.0, 2026-09-01) — fixed
+
+> **Confirmed rejected**: opening the change stream failed with
+> `Feature not supported: $$REMOVE`.
+>
+> Fixed by giving DocumentDB its own pipeline that only adds `_docID`. The
+> `$$REMOVE` pruning of `updateDescription`/`wallTime`/`documentKey` was a
+> bandwidth optimisation, and `ParsedEvent` ignores unknown fields, so dropping
+> it costs payload size and nothing else. `$bsonSize` and
+> `showSystemEvents`/`showExpandedEvents` were already flavor-gated in step 4.
 
 **Assumption.** The verifier's change stream pipeline
 (`change_stream.go:105-162`) survives DocumentDB's restrictions.
@@ -507,7 +539,26 @@ that could produce a deceptive lull.
 saw matches the writes performed. Repeat with a large `updateMany` in flight
 at writes-off time.
 
-### Q23. Index specs carry a `ns` field — **CLUSTER** (5.0.0, 2026-09-01) — needs code
+### Q23. Index specs carry a `ns` field — **CLUSTER** (5.0.0, 2026-09-01) — fixed
+
+> **Resolved, and worse than first recorded.** The full divergence is three
+> fields, not one:
+>
+> | field | DocumentDB | MongoDB 7.0 |
+> | --- | --- | --- |
+> | `v` | 4 | 2 |
+> | `ns` | present | absent |
+> | `2dsphereIndexVersion` | 1 | 3 |
+>
+> `v: 4` does not merely mismatch — the index comparator **aborts the entire
+> verification** with "index has an unexpected `v` value: 4".
+>
+> `normalizeIndexSpecForDocumentDB` drops `ns` and `2dsphereIndexVersion` and
+> rewrites `v` to 2. `v` cannot be dropped: the comparator requires the field
+> and fails with "extracting `v` from index spec: element not found".
+>
+> Everything defining an index — key, unique, sparse, partialFilterExpression,
+> expireAfterSeconds — matched exactly across all 10 index types tested.
 
 > **Confirmed divergence.** DocumentDB reports index specs as
 > `{v: 2, key: {_id: 1}, name: "_id_", ns: "db.coll"}`. MongoDB **removed**
@@ -521,7 +572,19 @@ source namespace, so it cannot match a remapped destination even in principle.
 Needs either a DocumentDB-aware normalisation that strips `ns` before
 comparison, or a default `--indexSpecIgnore` entry for DocumentDB sources.
 
-### Q24. Collection options diverge structurally — **CLUSTER** (5.0.0, 2026-09-01) — needs code
+### Q24. Collection options diverge structurally — **CLUSTER** (5.0.0, 2026-09-01) — fixed
+
+> **Far more severe than first recorded.** This was filed as a false-positive
+> noise problem. In fact it **silently skipped all document verification**.
+>
+> DocumentDB states `capped: false`; MongoDB omits the field. The inequality
+> made `canCompareData` false, which hits an early `return nil` before
+> partitioning — so generation 0 completed "successfully" having compared zero
+> documents, while reporting only a metadata mismatch.
+>
+> Fixed two ways: `isCappedOption` compares capped-ness semantically (absent ==
+> false), and `normalizeCollectionOptionsForDocumentDB` drops `storageEngine`
+> and `autoIndexId`.
 
 > **Confirmed divergence.** DocumentDB reported collection options as
 > `{autoIndexId: true, capped: false, storageEngine: {documentDB: {compression: {enable: false}}}}`.
@@ -586,6 +649,25 @@ It does matter for anything else pointed at the cluster: add
 `retryWrites=false` to `mongosh` and to any tooling that writes. If the
 verifier ever gains a source or destination write, this becomes a real
 requirement.
+
+### Q28. `$expr` partition filters work — **CLUSTER** (5.0.0, 2026-09-01) — no change needed
+
+> **Recorded because it was nearly "fixed" in the wrong direction.**
+>
+> When a run compared zero documents, `$expr` was the prime suspect:
+> `FilterIdBounds` uses `$expr` when the version is >= 5, and DocumentDB
+> reports 5. Testing disproved it — `$expr` with `$literal` MinKey/MaxKey
+> bounds returns all 50,000 documents, and `$expr` combined with `hint` and
+> `sort` behaves correctly too.
+>
+> The zero-document reading was a measurement error: the metadata query used
+> field names that do not exist (`source_documents_compared` rather than
+> `found_source_documents_count`), so `$sum` returned 0.
+>
+> Critically, the "fix" would have broken things. The alternative path,
+> `getExplicitTypeCheckPredicates`, emits `{_id: {$type: [...]}}`, and
+> DocumentDB rejects that: `Feature not supported: array for $type filter`.
+> **`FilterIdBounds` must keep using the `$expr` path for DocumentDB.**
 
 ---
 

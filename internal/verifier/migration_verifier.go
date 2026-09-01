@@ -1127,6 +1127,23 @@ func (verifier *Verifier) compareCollectionSpecifications(
 		}}, false, nil
 		// If the types differ, the rest is not important.
 	}
+	// DocumentDB and MongoDB describe collections with partly different option
+	// sets, so compare a normalised view. Both sides go through the same
+	// normalisation to keep the comparison symmetric.
+	if verifier.srcIsDocumentDB() {
+		var err error
+
+		srcSpec.Options, err = normalizeCollectionOptionsForDocumentDB(srcSpec.Options)
+		if err != nil {
+			return nil, false, errors.Wrapf(err, "normalizing %#q's source options", srcNs)
+		}
+
+		dstSpec.Options, err = normalizeCollectionOptionsForDocumentDB(dstSpec.Options)
+		if err != nil {
+			return nil, false, errors.Wrapf(err, "normalizing %#q's destination options", dstNs)
+		}
+	}
+
 	var results []compare.Result
 	if srcSpec.Info.ReadOnly != dstSpec.Info.ReadOnly {
 		results = append(results, compare.Result{
@@ -1182,8 +1199,15 @@ func (verifier *Verifier) compareCollectionSpecifications(
 		return nil, false, fmt.Errorf("unrecognized collection type (spec: %+v)", srcSpec)
 	}
 
-	// Do not compare data between capped and uncapped collections because the partitioning is different.
-	canCompareData = canCompareData && srcSpec.Options.Lookup("capped").Equal(dstSpec.Options.Lookup("capped"))
+	// Do not compare data between capped and uncapped collections because the
+	// partitioning is different.
+	//
+	// Compare the *meaning* rather than the raw values: DocumentDB states
+	// `capped: false` explicitly where MongoDB omits the field, and treating
+	// those as different would mark every collection uncomparable and silently
+	// skip document verification for the whole namespace.
+	canCompareData = canCompareData &&
+		isCappedOption(srcSpec.Options) == isCappedOption(dstSpec.Options)
 
 	return results, canCompareData, nil
 }
@@ -1296,6 +1320,20 @@ func (verifier *Verifier) verifyIndexes(
 
 	if dstIdIndexSpec != nil {
 		dstMap["_id"] = dstIdIndexSpec
+	}
+
+	// DocumentDB and MongoDB disagree on index-spec fields that describe the
+	// engine rather than the index (v, ns, 2dsphereIndexVersion). Normalise
+	// both sides so the comparison reflects real differences. Without this the
+	// comparator aborts on DocumentDB's `v: 4`.
+	if verifier.srcIsDocumentDB() {
+		if err := normalizeIndexSpecsForDocumentDB(srcMap); err != nil {
+			return nil, errors.Wrapf(err, "normalizing %#q's source index specs", FullName(srcColl))
+		}
+
+		if err := normalizeIndexSpecsForDocumentDB(dstMap); err != nil {
+			return nil, errors.Wrapf(err, "normalizing %#q's destination index specs", FullName(dstColl))
+		}
 	}
 
 	var results []compare.Result

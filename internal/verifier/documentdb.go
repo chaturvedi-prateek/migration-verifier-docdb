@@ -7,7 +7,9 @@ import (
 
 	"github.com/10gen/migration-verifier/internal/logger"
 	"github.com/10gen/migration-verifier/mmongo"
+	mapset "github.com/deckarep/golang-set/v2"
 	"github.com/pkg/errors"
+	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 )
 
@@ -284,4 +286,155 @@ func (verifier *Verifier) runDocumentDBSourcePreflight(ctx context.Context) erro
 // to call before the source URI is set, in which case it reports false.
 func (verifier *Verifier) srcIsDocumentDB() bool {
 	return verifier.srcClusterInfo != nil && verifier.srcClusterInfo.Flavor.IsDocumentDB()
+}
+
+// docDBIncomparableCollectionOptions are collection options that cannot be
+// compared meaningfully between DocumentDB and MongoDB.
+var docDBIncomparableCollectionOptions = mapset.NewSet(
+	// Storage-engine configuration. DocumentDB reports
+	// storageEngine.documentDB.compression; MongoDB reports wiredTiger
+	// settings or nothing at all. The two describe different engines and can
+	// never agree.
+	"storageEngine",
+
+	// Long removed from MongoDB, still reported by DocumentDB.
+	"autoIndexId",
+)
+
+// normalizeCollectionOptionsForDocumentDB strips collection options that
+// cannot be compared across implementations, so that metadata comparison
+// reflects real differences rather than engine trivia.
+//
+// It also drops `capped: false`, which DocumentDB states explicitly and
+// MongoDB omits. That one is not cosmetic: an unequal `capped` value makes
+// compareCollectionSpecifications report the collection uncomparable, which
+// skips document verification for the namespace entirely.
+func normalizeCollectionOptionsForDocumentDB(opts bson.Raw) (bson.Raw, error) {
+	if len(opts) == 0 {
+		return opts, nil
+	}
+
+	elems, err := opts.Elements()
+	if err != nil {
+		return nil, errors.Wrapf(err, "reading collection options (%v)", opts)
+	}
+
+	kept := bson.D{}
+
+	for _, el := range elems {
+		key := el.Key()
+
+		if docDBIncomparableCollectionOptions.Contains(key) {
+			continue
+		}
+
+		// `capped: false` is equivalent to the field being absent.
+		if key == "capped" {
+			asBool, ok := el.Value().BooleanOK()
+			if ok && !asBool {
+				continue
+			}
+		}
+
+		kept = append(kept, bson.E{Key: key, Value: el.Value()})
+	}
+
+	raw, err := bson.Marshal(kept)
+	if err != nil {
+		return nil, errors.Wrapf(err, "re-encoding collection options (%v)", kept)
+	}
+
+	return raw, nil
+}
+
+// isCappedOption reports whether a collection options document marks the
+// collection capped. A missing field means not capped.
+func isCappedOption(opts bson.Raw) bool {
+	asBool, ok := opts.Lookup("capped").BooleanOK()
+
+	return ok && asBool
+}
+
+// docDBIncomparableIndexFields are index-specification fields that describe
+// engine internals rather than the index's meaning, and so cannot be compared
+// between DocumentDB and MongoDB.
+//
+// Observed on DocumentDB 5.0.0 against MongoDB 7.0:
+//
+//	field                  DocumentDB   MongoDB
+//	v                      4            2
+//	ns                     present      absent (removed in MongoDB 4.4)
+//	2dsphereIndexVersion   1            3
+//
+// Everything that defines the index — key, unique, sparse,
+// partialFilterExpression, expireAfterSeconds — matches exactly, so dropping
+// these three fields compares the indexes that actually exist rather than the
+// engines that hold them.
+//
+// The `v` mismatch is not merely noisy: the index comparator rejects
+// DocumentDB's value outright with "index has an unexpected `v` value: 4",
+// which aborts the whole verification. `v` is rewritten rather than dropped,
+// because the comparator also requires the field to be present.
+var docDBIncomparableIndexFields = mapset.NewSet(
+	"ns",
+	"2dsphereIndexVersion",
+)
+
+// docDBNormalizedIndexVersion is the `v` value we rewrite index specs to.
+//
+// `v` cannot simply be dropped: the index comparator requires it and fails
+// with "extracting `v` from index spec: element not found". So we rewrite both
+// sides to MongoDB's modern value, which makes the comparison meaningful
+// without asking the comparator to understand DocumentDB's numbering.
+const docDBNormalizedIndexVersion = int32(2)
+
+// normalizeIndexSpecForDocumentDB strips engine-internal fields from an index
+// specification so that source and destination can be compared meaningfully.
+func normalizeIndexSpecForDocumentDB(spec bson.Raw) (bson.Raw, error) {
+	if len(spec) == 0 {
+		return spec, nil
+	}
+
+	elems, err := spec.Elements()
+	if err != nil {
+		return nil, errors.Wrapf(err, "reading index specification (%v)", spec)
+	}
+
+	kept := bson.D{}
+
+	for _, el := range elems {
+		key := el.Key()
+
+		if docDBIncomparableIndexFields.Contains(key) {
+			continue
+		}
+
+		if key == "v" {
+			kept = append(kept, bson.E{Key: key, Value: docDBNormalizedIndexVersion})
+			continue
+		}
+
+		kept = append(kept, bson.E{Key: key, Value: el.Value()})
+	}
+
+	raw, err := bson.Marshal(kept)
+	if err != nil {
+		return nil, errors.Wrapf(err, "re-encoding index specification (%v)", kept)
+	}
+
+	return raw, nil
+}
+
+// normalizeIndexSpecsForDocumentDB normalizes every spec in the map in place.
+func normalizeIndexSpecsForDocumentDB(specs map[string]bson.Raw) error {
+	for name, spec := range specs {
+		normalized, err := normalizeIndexSpecForDocumentDB(spec)
+		if err != nil {
+			return errors.Wrapf(err, "normalizing index %#q", name)
+		}
+
+		specs[name] = normalized
+	}
+
+	return nil
 }

@@ -561,6 +561,18 @@ func TolerateSimpleDuplicateKeyInBulk(
 // entry, so the stream cannot be resumed without a gap.
 const changeStreamHistoryLostErrCode = 286
 
+// cappedPositionLostErrCode is what DocumentDB returns when a resume token has
+// aged out of the change stream log:
+//
+//	code 136, "CappedPositionLost: CollectionScan died due to position in
+//	capped collection being deleted."
+//
+// It reports the mechanism (its change stream log is a capped collection)
+// rather than the meaning, and shares neither code nor wording with MongoDB's
+// ChangeStreamHistoryLost. Confirmed against DocumentDB 5.0.0 on 2026-09-01 by
+// resuming from a token whose timestamp predated the retention window.
+const cappedPositionLostErrCode = 136
+
 // IsChangeStreamHistoryLostError reports whether resuming a change stream
 // failed because the requested resume point is no longer retained.
 //
@@ -570,14 +582,15 @@ const changeStreamHistoryLostErrCode = 286
 // past that point would leave an unobserved window of changes, which would
 // silently invalidate the verification.
 //
-// DocumentDB's error code for this is not documented, so we also match on the
-// message text that server implementations conventionally use.
+// We match both servers' codes, plus message text, because neither code is
+// documented as stable API.
 func IsChangeStreamHistoryLostError(err error) bool {
 	if err == nil {
 		return false
 	}
 
-	if GetErrorCode(err) == changeStreamHistoryLostErrCode {
+	switch GetErrorCode(err) {
+	case changeStreamHistoryLostErrCode, cappedPositionLostErrCode:
 		return true
 	}
 
@@ -585,6 +598,7 @@ func IsChangeStreamHistoryLostError(err error) bool {
 
 	for _, phrase := range []string{
 		"changestreamhistorylost",
+		"cappedpositionlost",
 		"resume point may no longer be in the oplog",
 		"resume token was not found",
 		"resume of change stream was not possible",
