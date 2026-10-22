@@ -332,6 +332,8 @@ func (rc *ChangeReaderCommon) start(
 						return errors.Wrap(err, "failed to start session")
 					}
 
+					defer sess.EndSession(ctx)
+
 					if rc.createIteratorCb == nil {
 						panic("rc.createIteratorCb should be set")
 					}
@@ -344,13 +346,13 @@ func (rc *ChangeReaderCommon) start(
 
 						if parentThreadWaiting {
 							logEvent.Msg("Change reader open failed.")
-
-							initialCreateResultChan <- mo.Err[bson.Timestamp](err)
-							return nil
+						} else {
+							logEvent.Msg("Retried change reader open failed.")
 						}
 
-						logEvent.Msg("Retried change reader open failed.")
-
+						// Return the error so the retryer can retry it if it’s
+						// transient. If we exhaust our retries, the code after
+						// Run() reports the failure to the parent thread.
 						return err
 					}
 
@@ -372,6 +374,13 @@ func (rc *ChangeReaderCommon) start(
 				},
 				"reading %s’s changes", rc.readerType,
 			).Run(ctx, rc.logger)
+
+			if parentThreadWaiting {
+				// The change stream never opened, so the parent thread is
+				// still blocked waiting for a result. Deliver the failure,
+				// which the retryer has already retried as appropriate.
+				initialCreateResultChan <- mo.Err[bson.Timestamp](err)
+			}
 
 			return err
 		},
