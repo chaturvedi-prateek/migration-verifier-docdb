@@ -745,6 +745,36 @@ DocumentDB requires TLS, and a tunnelled connection needs some care:
   forwarded port is fine) or use `tlsInsecure=true`.
 - The read preference must resolve to the primary; see below.
 
+## Using a configuration file
+
+Put the verifier options in a YAML file to avoid placing a long DocumentDB
+connection string on the command line. Configuration keys use the corresponding
+flag name without the leading `--`.
+
+For example, save the following as `documentdb-verifier.yaml`, replacing the
+placeholder connection strings and certificate path:
+
+```yaml
+srcURI: "mongodb://<documentdb-endpoint>:27017/?tls=true&tlsCAFile=/absolute/path/global-bundle.pem&directConnection=true&retryWrites=false"
+dstURI: "mongodb://<mongodb-destination-uri>"
+metaURI: "mongodb://<mongodb-metadata-uri>"
+srcFlavor: documentdb
+readPreference: primary
+verifyAll: true
+serverPort: 0
+start: true
+```
+
+Start the verifier with the configuration file:
+
+```sh
+./migration_verifier --configFile documentdb-verifier.yaml
+```
+
+`start: true` starts verification immediately. Omit it to start the process
+and then call the `check` API described below. Before starting, enable change
+streams as required in [Required setup: enable change streams](#required-setup-enable-change-streams).
+
 ## Required setup: enable change streams
 
 DocumentDB disables change streams by default, and a change stream opened
