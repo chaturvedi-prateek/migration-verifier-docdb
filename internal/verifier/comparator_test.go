@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/10gen/migration-verifier/contextplus"
 	"github.com/10gen/migration-verifier/internal/testutil"
 	"github.com/10gen/migration-verifier/internal/verifier/compare"
 	"github.com/10gen/migration-verifier/internal/verifier/tasks"
@@ -177,8 +178,8 @@ func TestProgressNotifier(t *testing.T) {
 func TestComparatorStopsOnCancellation(t *testing.T) {
 	c := newTestComparator(t, newReadProgress(), newReadProgress(), time.Hour)
 
-	ctx, cancel := context.WithCancel(t.Context())
-	cancel()
+	ctx, cancel := contextplus.WithCancelCause(t.Context())
+	cancel(context.Canceled)
 
 	errChan := make(chan error, 1)
 	go func() {
@@ -195,5 +196,99 @@ func TestComparatorStopsOnCancellation(t *testing.T) {
 		require.ErrorIs(t, err, context.Canceled)
 	case <-time.After(10 * time.Second):
 		require.FailNow(t, "comparator did not return after cancellation")
+	}
+}
+
+// Waiting for source IDs follows source liveness, but running a destination
+// query must not borrow source progress.
+func TestDestinationProgressDependsOnSourceOnlyWhileWaitingForIDs(t *testing.T) {
+	srcProgress := newReadProgress()
+	dstProgress := newReadProgress()
+	dstProgress.inputProgress = srcProgress
+	notifier := progressNotifier{&testutil.MockSuccessNotifier{}, dstProgress}
+	c := newTestComparator(t, srcProgress, dstProgress, time.Minute)
+	old := time.Now().Add(-time.Hour)
+	dstProgress.last.Store(old)
+
+	notifier.setWaitingForInput(true)
+	require.NoError(t, c.checkReaderStalled("destination", dstProgress, old))
+
+	notifier.setWaitingForInput(false)
+	dstProgress.last.Store(old)
+	require.ErrorIs(t, c.checkReaderStalled("destination", dstProgress, old), errReaderStalled)
+
+	notifier.setWaitingForInput(true)
+	dstProgress.last.Store(old)
+	srcProgress.last.Store(old)
+	require.ErrorIs(t, c.checkReaderStalled("destination", dstProgress, old), errReaderStalled)
+}
+
+func TestComparatorWaitsForSourceIDsWhileSourceIsActive(t *testing.T) {
+	srcProgress := newReadProgress()
+	dstProgress := newReadProgress()
+	dstProgress.inputProgress = srcProgress
+	notifier := progressNotifier{&testutil.MockSuccessNotifier{}, dstProgress}
+	notifier.setWaitingForInput(true)
+	c := newTestComparator(t, srcProgress, dstProgress, 200*time.Millisecond)
+	srcChannel := make(chan compare.ToComparatorMsg)
+	dstChannel := make(chan compare.ToComparatorMsg)
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+		defer close(srcChannel)
+		defer close(dstChannel)
+		ticker := time.NewTicker(c.readTimeout / 4)
+		defer ticker.Stop()
+		ready := time.NewTimer(3 * c.readTimeout)
+		defer ready.Stop()
+		for {
+			select {
+			case <-t.Context().Done():
+				return
+			case <-ticker.C:
+				srcProgress.touch()
+			case <-ready.C:
+				// The empty batch represents the first completed source read;
+				// no data has to be pooled for this channel-liveness test.
+				select {
+				case srcChannel <- compare.ToComparatorMsg{}:
+				case <-t.Context().Done():
+					return
+				}
+				notifier.NoteSuccess("received source IDs")
+				notifier.setWaitingForInput(false)
+				select {
+				case dstChannel <- compare.ToComparatorMsg{}:
+				case <-t.Context().Done():
+				}
+				return
+			}
+		}
+	}()
+
+	require.NoError(t, runComparator(t, c, srcChannel, dstChannel))
+	<-done
+}
+
+func TestComparatorFailsOnDestinationOrBothReadersStalling(t *testing.T) {
+	for _, both := range []bool{false, true} {
+		name := "destination"
+		if both {
+			name = "both"
+		}
+		t.Run(name, func(t *testing.T) {
+			c := newTestComparator(t, newReadProgress(), newReadProgress(), 200*time.Millisecond)
+			srcChannel := make(chan compare.ToComparatorMsg, 1)
+			if !both {
+				srcChannel <- compare.ToComparatorMsg{}
+				close(srcChannel)
+			}
+			err := runComparator(t, c, srcChannel, make(chan compare.ToComparatorMsg))
+			require.ErrorIs(t, err, errReaderStalled)
+			if !both {
+				require.ErrorContains(t, err, "destination")
+			}
+		})
 	}
 }
