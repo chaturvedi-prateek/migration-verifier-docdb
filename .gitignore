@@ -4,3 +4,5 @@ migration_verifier
 internal/verifier/mongodb_exec/
 verifier_expansion.yml
 docs/
+.DS_Store
+Screenshot*

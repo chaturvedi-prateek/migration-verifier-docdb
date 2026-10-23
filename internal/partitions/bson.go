@@ -130,3 +130,47 @@ func typesToStrings(in []bson.Type) []string {
 		},
 	)
 }
+
+// sortBracket returns the comparison group to which the given BSON type
+// belongs. The server compares all numeric types with one another, and
+// likewise all string-like types; every other type compares only with itself.
+func sortBracket(t bson.Type) bson.Type {
+	switch {
+	case slices.Contains(numericTypes, t):
+		return bson.TypeDouble
+	case slices.Contains(stringTypes, t):
+		return bson.TypeString
+	default:
+		return t
+	}
+}
+
+// SameSortBracket reports whether the server compares values of the given
+// BSON types directly, i.e., without type bracketing between them.
+//
+// Because the BSON sort order groups each bracket contiguously, every value
+// that sorts between two values of the same bracket is also in that bracket.
+func SameSortBracket(a, b bson.Type) bool {
+	return sortBracket(a) == sortBracket(b)
+}
+
+// RangeIdPredicates returns plain (indexable, type-bracketed) range
+// predicates on _id for the given inclusive bounds. A MinKey lower bound or a
+// MaxKey upper bound adds no predicate.
+//
+// Because these predicates are type-bracketed, they match the same documents
+// as FilterIdBounds only if every _id in the range shares the bounds’ sort
+// bracket. Callers must establish that before using them.
+func RangeIdPredicates(lower, upper bson.RawValue) []bson.D {
+	var predicates []bson.D
+
+	if lower.Type != bson.TypeMinKey {
+		predicates = append(predicates, bson.D{{"_id", bson.D{{"$gte", lower}}}})
+	}
+
+	if upper.Type != bson.TypeMaxKey {
+		predicates = append(predicates, bson.D{{"_id", bson.D{{"$lte", upper}}}})
+	}
+
+	return predicates
+}

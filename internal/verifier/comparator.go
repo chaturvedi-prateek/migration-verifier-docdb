@@ -36,7 +36,14 @@ type comparator struct {
 	// Channel states
 	srcClosed bool
 	dstClosed bool
-	readTimer *time.Timer
+
+	// Reader liveness: the comparator fails if a reader it is waiting on
+	// makes no progress for readTimeout. Progress is checked every
+	// stallCheckInterval.
+	srcProgress        *readProgress
+	dstProgress        *readProgress
+	readTimeout        time.Duration
+	stallCheckInterval time.Duration
 
 	// Caches
 	srcCache map[string]compare.DocWithTS
@@ -69,13 +76,24 @@ type comparator struct {
 	mapKeyBytes             []byte
 }
 
-func newComparator(v *Verifier, workerNum int, fi retry.SuccessNotifier, task *tasks.Task) *comparator {
+func newComparator(
+	v *Verifier,
+	workerNum int,
+	fi retry.SuccessNotifier,
+	task *tasks.Task,
+	srcProgress, dstProgress *readProgress,
+) *comparator {
 	return &comparator{
 		verifier:  v,
 		task:      task,
 		namespace: task.QueryFilter.Namespace,
 		workerNum: workerNum,
 		fi:        fi,
+
+		srcProgress:        srcProgress,
+		dstProgress:        dstProgress,
+		readTimeout:        readTimeout,
+		stallCheckInterval: stallCheckInterval,
 
 		srcCache: map[string]compare.DocWithTS{},
 		dstCache: map[string]compare.DocWithTS{},
@@ -86,7 +104,6 @@ func newComparator(v *Verifier, workerNum int, fi retry.SuccessNotifier, task *t
 			docCompareMethod: v.docCompareMethod,
 		},
 		mapKeyFieldNames: task.QueryFilter.GetDocKeyFields(),
-		readTimer:        time.NewTimer(0),
 	}
 }
 
@@ -105,7 +122,10 @@ func (c *comparator) readBatches(
 	ctx context.Context,
 	srcChannel, dstChannel <-chan compare.ToComparatorMsg,
 ) ([]compare.DocWithTS, []compare.DocWithTS, bool, error) {
-	simpleTimerReset(c.readTimer, readTimeout)
+	// Readers can’t make progress while the comparator isn’t listening (e.g.,
+	// while it compares a batch), so stall time counts only from when this
+	// wait started.
+	waitStart := time.Now()
 
 	var srcBatch, dstBatch []compare.DocWithTS
 	var dstCursorDone bool
@@ -114,50 +134,63 @@ func (c *comparator) readBatches(
 
 	if !c.srcClosed {
 		eg.Go(func() error {
-			select {
-			case <-egCtx.Done():
-				return egCtx.Err()
-			case <-c.readTimer.C:
-				return errors.Errorf("failed to read from source after %s", readTimeout)
-			case msg, alive := <-srcChannel:
-				if !alive {
-					c.srcClosed = true
+			ticker := time.NewTicker(c.stallCheckInterval)
+			defer ticker.Stop()
+
+			for {
+				select {
+				case <-egCtx.Done():
+					return egCtx.Err()
+				case <-ticker.C:
+					if err := c.checkReaderStalled("source", c.srcProgress, waitStart); err != nil {
+						return err
+					}
+				case msg, alive := <-srcChannel:
+					if !alive {
+						c.srcClosed = true
+						return nil
+					}
+
+					c.fi.NoteSuccess("received message from source reader")
+
+					lo.Assertf(
+						msg.Type == compare.MsgTypeDocs,
+						"source reader must send only docs (got: %v)",
+						msg.Type,
+					)
+
+					lo.Assertf(
+						len(msg.DocsWithTS) <= compare.ToComparatorBatchSize,
+						"src reader should send <= %d docs but sent %d",
+						compare.ToComparatorBatchSize,
+						len(msg.DocsWithTS),
+					)
+
+					c.recordSrcMetrics(msg.DocsWithTS)
+
+					srcBatch = msg.DocsWithTS
+
 					return nil
 				}
-
-				c.fi.NoteSuccess("received message from source reader")
-
-				lo.Assertf(
-					msg.Type == compare.MsgTypeDocs,
-					"source reader must send only docs (got: %v)",
-					msg.Type,
-				)
-
-				lo.Assertf(
-					len(msg.DocsWithTS) <= compare.ToComparatorBatchSize,
-					"src reader should send <= %d docs but sent %d",
-					compare.ToComparatorBatchSize,
-					len(msg.DocsWithTS),
-				)
-
-				c.recordSrcMetrics(msg.DocsWithTS)
-
-				srcBatch = msg.DocsWithTS
 			}
-			return nil
 		})
 	}
 
 	if !c.dstClosed {
 		eg.Go(func() error {
+			ticker := time.NewTicker(c.stallCheckInterval)
+			defer ticker.Stop()
+
 			// Reading from the destination reader is trickier than reading
 			// from the source reader because the messages can contain flags.
 			for {
 				select {
 				case <-egCtx.Done():
 					return egCtx.Err()
-				case <-c.readTimer.C:
-					return errors.Errorf("failed to read from destination after %s", readTimeout)
+				case <-ticker.C:
+					if err := c.checkReaderStalled("destination", c.dstProgress, waitStart); err != nil {
+						return err
+					}
 				case msg, alive := <-dstChannel:
 					if !alive {
 						c.dstClosed = true
@@ -208,12 +241,31 @@ func (c *comparator) readBatches(
 	return srcBatch, dstBatch, dstCursorDone, nil
 }
 
-func simpleTimerReset(t *time.Timer, dur time.Duration) {
-	if !t.Stop() {
-		<-t.C
+// checkReaderStalled returns an error if the given reader has made no
+// progress for the comparator’s read timeout, counting from no earlier than
+// waitStart.
+func (c *comparator) checkReaderStalled(
+	side string,
+	progress *readProgress,
+	waitStart time.Time,
+) error {
+	since := waitStart
+	if last := progress.lastProgress(); last.After(since) {
+		since = last
 	}
 
-	t.Reset(dur)
+	idle := time.Since(since)
+	if idle < c.readTimeout {
+		return nil
+	}
+
+	return errors.Wrapf(
+		errReaderStalled,
+		"%s reader made no progress for %s (limit: %s)",
+		side,
+		idle.Round(time.Second),
+		c.readTimeout,
+	)
 }
 
 // recordSrcMetrics isolates the noise of tracking business metrics.

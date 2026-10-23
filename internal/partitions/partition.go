@@ -129,6 +129,39 @@ func (pqp PartitionQueryParameters) ToFindOptions() bson.D {
 // If the passed-in buildinfo indicates a mongodb version < 5.0, type bracketing is not used.
 // filterAndPredicates is a slice of filter criteria that's used to construct the "filter" field in the find option.
 func (p *Partition) GetQueryParameters(clusterInfo *util.ClusterInfo, filterAndPredicates bson.A) (PartitionQueryParameters, error) {
+	return p.getQueryParameters(
+		filterAndPredicates,
+		func() ([]bson.D, error) {
+			return FilterIdBounds(clusterInfo, p.Key.Lower, p.Upper)
+		},
+	)
+}
+
+// GetQueryParametersForIdRange is like GetQueryParameters but bounds _id
+// with plain range predicates (see RangeIdPredicates) rather than
+// FilterIdBounds. Some servers (e.g., Amazon DocumentDB) can’t use an index
+// to satisfy FilterIdBounds’s $expr predicates, so they scan the _id index
+// from its start to find the partition.
+//
+// The caller must ensure that every _id within the partition shares the
+// bounds’ sort bracket; otherwise this can miss documents.
+func (p *Partition) GetQueryParametersForIdRange(filterAndPredicates bson.A) PartitionQueryParameters {
+	params, err := p.getQueryParameters(
+		filterAndPredicates,
+		func() ([]bson.D, error) {
+			return RangeIdPredicates(p.Key.Lower, p.Upper), nil
+		},
+	)
+
+	lo.Assertf(err == nil, "plain _id range predicates cannot fail (got: %v)", err)
+
+	return params
+}
+
+func (p *Partition) getQueryParameters(
+	filterAndPredicates bson.A,
+	getIdPredicates func() ([]bson.D, error),
+) (PartitionQueryParameters, error) {
 	params := PartitionQueryParameters{}
 
 	if p == nil {
@@ -148,7 +181,7 @@ func (p *Partition) GetQueryParameters(clusterInfo *util.ClusterInfo, filterAndP
 		// that a given document spends cached in memory.
 		params.sortField = option.Some("_id")
 
-		newPredicates, err := FilterIdBounds(clusterInfo, p.Key.Lower, p.Upper)
+		newPredicates, err := getIdPredicates()
 		if err != nil {
 			return PartitionQueryParameters{}, err
 		}

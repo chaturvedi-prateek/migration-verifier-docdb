@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/10gen/migration-verifier/chanutil"
+	"github.com/10gen/migration-verifier/internal/partitions"
 	"github.com/10gen/migration-verifier/internal/reportutils"
 	"github.com/10gen/migration-verifier/internal/retry"
 	"github.com/10gen/migration-verifier/internal/types"
@@ -32,7 +33,13 @@ import (
 )
 
 const (
+	// The comparator fails a task if a reader it is waiting on makes no
+	// progress (receives no documents and sends none) for this long. A slow
+	// reader that keeps receiving documents is not considered stalled.
 	readTimeout = 10 * time.Minute
+
+	// How often the comparator checks for a stalled reader while waiting.
+	stallCheckInterval = 10 * time.Second
 
 	// Every (this many) docs, add stats to the doc & byte count histories.
 	comparisonHistoryThreshold = 500
@@ -60,6 +67,7 @@ func (verifier *Verifier) FetchAndCompareDocuments(
 ) <-chan mo.Result[DocCompareReport] {
 	var srcChannel, dstChannel <-chan compare.ToComparatorMsg
 	var readSrcCallback, readDstCallback func(context.Context, retry.SuccessNotifier) error
+	var srcProgress, dstProgress *readProgress
 
 	retryer := retry.New().WithDescription(
 		"comparing task %v's documents (namespace: %s)",
@@ -76,6 +84,9 @@ func (verifier *Verifier) FetchAndCompareDocuments(
 			WithBefore(func() error {
 				var err error
 
+				srcProgress = newReadProgress()
+				dstProgress = newReadProgress()
+
 				srcChannel, dstChannel, readSrcCallback, readDstCallback, err = verifier.getFetcherChannelsAndCallbacks(task)
 
 				return err
@@ -83,13 +94,13 @@ func (verifier *Verifier) FetchAndCompareDocuments(
 			WithErrorCodes(util.CursorKilledErrCode).
 			WithCallback(
 				func(ctx context.Context, fi *retry.FuncInfo) error {
-					return readSrcCallback(ctx, fi)
+					return readSrcCallback(ctx, progressNotifier{fi, srcProgress})
 				},
 				"reading from source",
 			).
 			WithCallback(
 				func(ctx context.Context, fi *retry.FuncInfo) error {
-					return readDstCallback(ctx, fi)
+					return readDstCallback(ctx, progressNotifier{fi, dstProgress})
 				},
 				"reading from destination",
 			).
@@ -112,6 +123,8 @@ func (verifier *Verifier) FetchAndCompareDocuments(
 						task,
 						srcChannel,
 						dstChannel,
+						srcProgress,
+						dstProgress,
 						reportChan,
 					)
 				},
@@ -166,15 +179,25 @@ func (verifier *Verifier) compareDocsFromChannels(
 	fi retry.SuccessNotifier,
 	task *tasks.Task,
 	srcChannel, dstChannel <-chan compare.ToComparatorMsg,
+	srcProgress, dstProgress *readProgress,
 	reportsChan chan<- DocCompareReport,
 ) error {
 	// 1. Initialize State
-	c := newComparator(verifier, workerNum, fi, task)
-	defer func() {
-		if !c.readTimer.Stop() {
-			<-c.readTimer.C
-		}
-	}()
+	c := newComparator(verifier, workerNum, fi, task, srcProgress, dstProgress)
+
+	return c.run(ctx, srcChannel, dstChannel, reportsChan)
+}
+
+// run reads and compares documents from the given channels until both are
+// closed, then flushes any remaining problems.
+func (c *comparator) run(
+	ctx context.Context,
+	srcChannel, dstChannel <-chan compare.ToComparatorMsg,
+	reportsChan chan<- DocCompareReport,
+) error {
+	verifier := c.verifier
+	task := c.task
+	workerNum := c.workerNum
 
 	verifier.docsComparedHistory.Add(0)
 	verifier.bytesComparedHistory.Add(0)
@@ -733,12 +756,23 @@ func (verifier *Verifier) getDocumentsCursor(
 			{"batchSize", math.MaxInt32},
 		}
 	} else {
-		pqp, err := task.QueryFilter.Partition.GetQueryParameters(
-			clusterInfo,
-			verifier.maybeAppendGlobalFilterToPredicates(andPredicates),
-		)
+		partition := task.QueryFilter.Partition
+		filterPredicates := verifier.maybeAppendGlobalFilterToPredicates(andPredicates)
+
+		useIdRange, err := verifier.canUseIdRangeFilter(sctx, collection, clusterInfo, partition)
 		if err != nil {
-			return nil, errors.Wrapf(err, "getting query parameters for task: %+v", task)
+			return nil, errors.Wrapf(err, "checking whether task %v can use a plain _id range", task.PrimaryKey)
+		}
+
+		var pqp partitions.PartitionQueryParameters
+
+		if useIdRange {
+			pqp = partition.GetQueryParametersForIdRange(filterPredicates)
+		} else {
+			pqp, err = partition.GetQueryParameters(clusterInfo, filterPredicates)
+			if err != nil {
+				return nil, errors.Wrapf(err, "getting query parameters for task: %+v", task)
+			}
 		}
 
 		findOptions = pqp.ToFindOptions()

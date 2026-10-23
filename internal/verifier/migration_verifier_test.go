@@ -1661,6 +1661,8 @@ func TestVerifierCompareDocs(t *testing.T) {
 									&fauxTask,
 									srcChannel,
 									dstChannel,
+									newReadProgress(),
+									newReadProgress(),
 									reportsChan,
 								)
 
