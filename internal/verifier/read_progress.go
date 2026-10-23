@@ -1,6 +1,7 @@
 package verifier
 
 import (
+	"sync/atomic"
 	"time"
 
 	"github.com/10gen/migration-verifier/internal/retry"
@@ -19,6 +20,12 @@ var errReaderStalled = errors.New("document reader stalled")
 // scan on a busy cluster) from one that is stuck.
 type readProgress struct {
 	last *msync.TypedAtomic[time.Time]
+
+	// A natural-partition destination reader needs IDs from the source
+	// before it can query the destination. Only that wait depends on source
+	// progress; once the IDs arrive, destination query progress stands alone.
+	inputProgress   *readProgress
+	waitingForInput atomic.Bool
 }
 
 func newReadProgress() *readProgress {
@@ -30,7 +37,22 @@ func (p *readProgress) touch() {
 }
 
 func (p *readProgress) lastProgress() time.Time {
-	return p.last.Load()
+	// Read the phase before the timestamp: setWaitingForInput records a new
+	// timestamp before publishing the phase change.
+	waiting := p.waitingForInput.Load()
+	last := p.last.Load()
+	if p.inputProgress != nil && waiting {
+		if inputLast := p.inputProgress.lastProgress(); inputLast.After(last) {
+			last = inputLast
+		}
+	}
+	return last
+}
+
+// inputWaitNotifier is implemented by notifiers that distinguish waiting
+// for source IDs from running a destination query.
+type inputWaitNotifier interface {
+	setWaitingForInput(bool)
 }
 
 // progressNotifier records reader progress on every success notification
@@ -41,6 +63,15 @@ type progressNotifier struct {
 }
 
 var _ retry.SuccessNotifier = progressNotifier{}
+var _ inputWaitNotifier = progressNotifier{}
+
+func (n progressNotifier) setWaitingForInput(waiting bool) {
+	// Changing phases starts a new wait. Record it before disabling the
+	// dependency so the watchdog cannot see an old destination timestamp
+	// between receiving source IDs and opening the destination query.
+	n.progress.touch()
+	n.progress.waitingForInput.Store(waiting)
+}
 
 func (n progressNotifier) NoteSuccess(tmpl string, args ...any) {
 	n.progress.touch()

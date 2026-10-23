@@ -849,7 +849,7 @@ It does matter for anything else pointed at the cluster: add
 verifier ever gains a source or destination write, this becomes a real
 requirement.
 
-### Q28. `$expr` partition filters work — **CLUSTER** (5.0.0, 2026-09-01) — no change needed
+### Q28. `$expr` partition filters work — **CLUSTER** (5.0.0, 2026-09-01) — correctness verified
 
 > **Recorded because it was nearly "fixed" in the wrong direction.**
 >
@@ -867,6 +867,15 @@ requirement.
 > `getExplicitTypeCheckPredicates`, emits `{_id: {$type: [...]}}`, and
 > DocumentDB rejects that: `Feature not supported: array for $type filter`.
 > **`FilterIdBounds` must keep using the `$expr` path for DocumentDB.**
+
+**2026-10-23 update:** The historical test above verified result correctness,
+not large-collection performance. Document verification now selects plain
+`_id` ranges when the bounds' comparison bracket and, for open-ended ranges,
+fresh collection type extremes establish equivalent coverage. Cross-bracket
+ranges still use `FilterIdBounds`'s `$expr` path. The pre-v5 `$type`-array
+fallback remains unsuitable for DocumentDB. Performance and query-plan
+improvements must be measured on the actual engine; missing bounds in an
+explain display alone do not prove a full-index scan.
 
 ### Q29. Sessions must disable causal consistency — **CLUSTER** (5.0.0, 2026-09-01) — fixed
 

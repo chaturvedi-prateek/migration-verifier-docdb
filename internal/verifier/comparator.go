@@ -1,6 +1,7 @@
 package verifier
 
 import (
+	"cmp"
 	"context"
 	"slices"
 	"time"
@@ -83,6 +84,7 @@ func newComparator(
 	task *tasks.Task,
 	srcProgress, dstProgress *readProgress,
 ) *comparator {
+	timeout := cmp.Or(v.documentReadTimeout, readTimeout)
 	return &comparator{
 		verifier:  v,
 		task:      task,
@@ -92,8 +94,8 @@ func newComparator(
 
 		srcProgress:        srcProgress,
 		dstProgress:        dstProgress,
-		readTimeout:        readTimeout,
-		stallCheckInterval: stallCheckInterval,
+		readTimeout:        timeout,
+		stallCheckInterval: min(stallCheckInterval, timeout/10),
 
 		srcCache: map[string]compare.DocWithTS{},
 		dstCache: map[string]compare.DocWithTS{},

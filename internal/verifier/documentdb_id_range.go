@@ -23,10 +23,9 @@ type idTypeExtremes struct {
 // partition’s documents with plain _id range predicates rather than the $expr
 // predicates from partitions.FilterIdBounds.
 //
-// DocumentDB doesn’t use the _id index’s bounds for those $expr predicates.
-// It instead scans the _id index from the start of the collection, which makes
-// each partition’s query slower the later it sits in the collection. Plain
-// range predicates let it seek directly to the partition.
+// Some DocumentDB query plans do not efficiently bound $expr index scans.
+// Plain range predicates expose the bounds directly to the query planner;
+// their performance must still be verified on the deployed engine version.
 //
 // Plain range predicates are type-bracketed, though, so this returns true only
 // when they match exactly the same documents as the $expr predicates.
@@ -103,17 +102,14 @@ func idRangeFilterIsExact(
 }
 
 // getIDTypeExtremes returns the types of the collection’s lowest and highest
-// _id values, or None if the collection is empty. Results are cached per
-// namespace.
+// _id values, or None if the collection is empty. Read them afresh for each
+// open-ended partition so a new source or verification never reuses stale
+// type information. Bounded partitions do not need these lookups.
 func (verifier *Verifier) getIDTypeExtremes(
 	ctx context.Context,
 	coll *mongo.Collection,
 ) (option.Option[idTypeExtremes], error) {
 	ns := FullName(coll)
-
-	if cached, ok := verifier.docDBIDTypes.Load(ns); ok {
-		return option.Some(cached.(idTypeExtremes)), nil
-	}
 
 	lowestOpt, err := findExtremeIDType(ctx, coll, 1)
 	if err != nil {
@@ -129,13 +125,10 @@ func (verifier *Verifier) getIDTypeExtremes(
 	highest, hasHighest := highestOpt.Get()
 
 	if !hasLowest || !hasHighest {
-		// Don’t cache emptiness; the collection may gain documents.
 		return option.None[idTypeExtremes](), nil
 	}
 
 	extremes := idTypeExtremes{lowest: lowest, highest: highest}
-	verifier.docDBIDTypes.Store(ns, extremes)
-
 	verifier.logger.Debug().
 		Str("namespace", ns).
 		Stringer("lowestIDType", lowest).

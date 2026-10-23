@@ -136,13 +136,12 @@ type Verifier struct {
 	numWorkers         int
 	failureDisplaySize int64
 
+	// Zero uses the default document-reader timeout.
+	documentReadTimeout time.Duration
+
 	// srcFlavor forces the source’s server flavor rather than detecting it.
 	// util.FlavorAuto (the default) means detect.
 	srcFlavor util.Flavor
-
-	// docDBIDTypes caches, per source namespace, the _id sort brackets found
-	// at the start & end of the collection. See canUseIdRangeFilter.
-	docDBIDTypes sync.Map
 
 	// readPreferenceMode is the read preference as the user requested it,
 	// retained so that flavor-specific validation can report it back.

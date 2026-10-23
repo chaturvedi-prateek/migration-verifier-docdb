@@ -808,6 +808,21 @@ Each of these fails at startup with an explanation:
 
 ## How correctness is maintained without causal consistency
 
+### DocumentDB partition query optimization
+
+For DocumentDB, document verification uses plain `_id` range predicates when
+the partition bounds share a BSON comparison bracket. Open-ended partitions
+also check the collection's current lowest/highest `_id` types before using
+this optimization. The type information is read afresh; it is not cached
+across source changes or verifier runs. Ranges spanning different brackets
+retain the `$expr` filter so mixed-type IDs are covered.
+
+This exposes range bounds directly to the DocumentDB planner. Check the actual
+query plan and timings on the deployed engine version to measure the benefit;
+an `IXSCAN` stage alone does not establish that the scan is efficiently bounded.
+
+### Read consistency
+
 Against MongoDB, every document read is pinned with
 `readConcern: {afterClusterTime: …}` so it cannot observe a state older than
 the change reader's start point. DocumentDB implements no causal consistency

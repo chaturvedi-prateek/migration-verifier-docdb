@@ -86,6 +86,9 @@ func (verifier *Verifier) FetchAndCompareDocuments(
 
 				srcProgress = newReadProgress()
 				dstProgress = newReadProgress()
+				if task.QueryFilter.Partition != nil && task.QueryFilter.Partition.Natural {
+					dstProgress.inputProgress = srcProgress
+				}
 
 				srcChannel, dstChannel, readSrcCallback, readDstCallback, err = verifier.getFetcherChannelsAndCallbacks(task)
 
@@ -361,7 +364,13 @@ func (verifier *Verifier) getFetcherChannelsAndCallbacksForNaturalPartition(
 		coll := verifier.dstClientCollection(task)
 
 		for {
+			if notifier, ok := state.(inputWaitNotifier); ok {
+				notifier.setWaitingForInput(true)
+			}
 			docIDsOpt, err := chanutil.ReadWithDoneCheck(sctx, srcToDstChannel)
+			if notifier, ok := state.(inputWaitNotifier); ok {
+				notifier.setWaitingForInput(false)
+			}
 			if err != nil {
 				return err
 			}
@@ -534,6 +543,7 @@ func (verifier *Verifier) getFetcherChannelsAndCallbacksForIDPartition(
 			return errors.Wrapf(err, "starting session")
 		}
 
+		defer sess.EndSession(ctx)
 		sctx := mongo.NewSessionContext(ctx, sess)
 
 		theCursor, err := verifier.getDocumentsCursor(
@@ -546,6 +556,7 @@ func (verifier *Verifier) getFetcherChannelsAndCallbacksForIDPartition(
 		)
 
 		if err == nil {
+			defer theCursor.Close(ctx)
 			state.NoteSuccess("opened src find cursor")
 
 			_, err = iterateCursorToChannel(
@@ -580,6 +591,7 @@ func (verifier *Verifier) getFetcherChannelsAndCallbacksForIDPartition(
 			return errors.Wrapf(err, "starting session")
 		}
 
+		defer sess.EndSession(ctx)
 		sctx := mongo.NewSessionContext(ctx, sess)
 
 		theCursor, err := verifier.getDocumentsCursor(
@@ -592,6 +604,7 @@ func (verifier *Verifier) getFetcherChannelsAndCallbacksForIDPartition(
 		)
 
 		if err == nil {
+			defer theCursor.Close(ctx)
 			state.NoteSuccess("opened dst find cursor")
 
 			_, err = iterateCursorToChannel(
@@ -767,7 +780,7 @@ func (verifier *Verifier) getDocumentsCursor(
 		var pqp partitions.PartitionQueryParameters
 
 		if useIdRange {
-			pqp = partition.GetQueryParametersForIdRange(filterPredicates)
+			pqp = partition.GetQueryParametersForIdRangeUnsafe(filterPredicates)
 		} else {
 			pqp, err = partition.GetQueryParameters(clusterInfo, filterPredicates)
 			if err != nil {

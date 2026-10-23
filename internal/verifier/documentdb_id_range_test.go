@@ -3,6 +3,8 @@ package verifier
 import (
 	"testing"
 
+	"github.com/10gen/migration-verifier/internal/partitions"
+	"github.com/10gen/migration-verifier/internal/util"
 	"github.com/mongodb-labs/migration-tools/bsontools"
 	"github.com/mongodb-labs/migration-tools/option"
 	"github.com/pkg/errors"
@@ -78,4 +80,33 @@ func TestIdRangeFilterIsExactPropagatesErrors(t *testing.T) {
 	)
 
 	require.ErrorIs(t, err, theErr)
+}
+
+func TestIDRangeSelectionRequiresDocumentDBIDPartitions(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		info      *util.ClusterInfo
+		partition *partitions.Partition
+		want      bool
+	}{
+		{name: "missing cluster"},
+		{name: "MongoDB", info: &util.ClusterInfo{Flavor: util.FlavorMongoDB}},
+		{name: "missing partition", info: &util.ClusterInfo{Flavor: util.FlavorDocumentDB}},
+		{name: "natural", info: &util.ClusterInfo{Flavor: util.FlavorDocumentDB}, partition: &partitions.Partition{Natural: true}},
+		{name: "capped", info: &util.ClusterInfo{Flavor: util.FlavorDocumentDB}, partition: &partitions.Partition{IsCapped: true}},
+		{
+			name: "bounded ObjectIDs", info: &util.ClusterInfo{Flavor: util.FlavorDocumentDB}, want: true,
+			partition: &partitions.Partition{
+				Key:   partitions.PartitionKey{Lower: bsontools.ToRawValue(bson.NewObjectID())},
+				Upper: bsontools.ToRawValue(bson.NewObjectID()),
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			v := NewVerifier(VerifierSettings{}, "stderr")
+			got, err := v.canUseIdRangeFilter(t.Context(), nil, tc.info, tc.partition)
+			require.NoError(t, err)
+			require.Equal(t, tc.want, got)
+		})
+	}
 }

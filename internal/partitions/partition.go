@@ -137,15 +137,14 @@ func (p *Partition) GetQueryParameters(clusterInfo *util.ClusterInfo, filterAndP
 	)
 }
 
-// GetQueryParametersForIdRange is like GetQueryParameters but bounds _id
+// GetQueryParametersForIdRangeUnsafe is like GetQueryParameters but bounds _id
 // with plain range predicates (see RangeIdPredicates) rather than
-// FilterIdBounds. Some servers (e.g., Amazon DocumentDB) can’t use an index
-// to satisfy FilterIdBounds’s $expr predicates, so they scan the _id index
-// from its start to find the partition.
+// FilterIdBounds. This can improve plans that do not efficiently bound
+// $expr index scans; the benefit depends on the server and query planner.
 //
 // The caller must ensure that every _id within the partition shares the
 // bounds’ sort bracket; otherwise this can miss documents.
-func (p *Partition) GetQueryParametersForIdRange(filterAndPredicates bson.A) PartitionQueryParameters {
+func (p *Partition) GetQueryParametersForIdRangeUnsafe(filterAndPredicates bson.A) PartitionQueryParameters {
 	params, err := p.getQueryParameters(
 		filterAndPredicates,
 		func() ([]bson.D, error) {

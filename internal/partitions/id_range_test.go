@@ -67,7 +67,7 @@ func TestRangeIdPredicates(t *testing.T) {
 	assert.Empty(t, RangeIdPredicates(minKey, maxKey), "both bounds open")
 }
 
-func TestGetQueryParametersForIdRange(t *testing.T) {
+func TestGetQueryParametersForIdRangeUnsafe(t *testing.T) {
 	lower := bsontools.ToRawValue(bson.NewObjectID())
 	upper := bsontools.ToRawValue(bson.NewObjectID())
 	extraFilter := bson.D{{"x", 1}}
@@ -78,7 +78,7 @@ func TestGetQueryParametersForIdRange(t *testing.T) {
 		Upper: upper,
 	}
 
-	findOptions := partition.GetQueryParametersForIdRange(bson.A{extraFilter}).ToFindOptions()
+	findOptions := partition.GetQueryParametersForIdRangeUnsafe(bson.A{extraFilter}).ToFindOptions()
 
 	require.Equal(
 		t,
@@ -95,7 +95,7 @@ func TestGetQueryParametersForIdRange(t *testing.T) {
 	)
 
 	partition.IsCapped = true
-	findOptions = partition.GetQueryParametersForIdRange(nil).ToFindOptions()
+	findOptions = partition.GetQueryParametersForIdRangeUnsafe(nil).ToFindOptions()
 
 	require.Equal(
 		t,
